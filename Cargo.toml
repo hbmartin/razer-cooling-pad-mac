@@ -1,0 +1,19 @@
+[package]
+name = "padctl"
+version = "0.1.0"
+edition = "2024"
+description = "CLI to control the fans and lights of a Razer Laptop Cooling Pad on macOS"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+hidapi = { version = "2.6", default-features = false, features = ["macos-shared-device"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+
+[profile.release]
+lto = true
+strip = true
