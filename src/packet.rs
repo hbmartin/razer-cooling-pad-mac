@@ -17,8 +17,10 @@
 //! | P[89]     | 0x00                                               |
 //!
 //! Byte layouts are replicated exactly from two known-good implementations:
-//! the FanControl Windows plugin (fan, transaction id 0x02) and openrazer's
-//! accessory driver (RGB, transaction id 0x1F). See reference/.
+//! a FanControl Windows plugin for this pad (fan, transaction id 0x02; see
+//! <https://github.com/Rem0o/FanControl.Releases>) and openrazer's accessory
+//! driver (RGB, transaction id 0x1F;
+//! <https://github.com/openrazer/openrazer>, driver/razerchromacommon.c).
 
 pub const PACKET_LEN: usize = 90;
 pub const REPORT_LEN: usize = 91;
@@ -141,8 +143,8 @@ mod tests {
     use crate::fan;
     use crate::rgb;
 
-    /// `Header90` from the known-good FanControl Windows plugin
-    /// (reference/windows.cs), with the fan-set command bytes for 2700 RPM
+    /// `Header90` from the known-good FanControl Windows plugin,
+    /// with the fan-set command bytes for 2700 RPM
     /// and its crc filled in exactly as `SetCurveRpm(2700)` produces.
     fn windows_plugin_report_2700rpm() -> [u8; REPORT_LEN] {
         let mut buf = [0u8; REPORT_LEN];
@@ -175,9 +177,12 @@ mod tests {
         // windows.cs hardcodes CHK_L = 0x18 for the off packet.
         let report = fan::off().to_report();
         assert_eq!(report[89], 0x18);
-        assert_eq!(&report[1..=12], &[
-            0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x0D, 0x10, 0x00, 0x06, 0x00, 0x00
-        ]);
+        assert_eq!(
+            &report[1..=12],
+            &[
+                0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x0D, 0x10, 0x00, 0x06, 0x00, 0x00
+            ]
+        );
     }
 
     #[test]
@@ -197,8 +202,63 @@ mod tests {
         assert_eq!(report[6], 0x09);
         assert_eq!(report[7], 0x0F);
         assert_eq!(report[8], 0x02);
-        assert_eq!(&report[9..=17], &[0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0xFF, 0x00, 0x00]);
+        assert_eq!(
+            &report[9..=17],
+            &[0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0xFF, 0x00, 0x00]
+        );
         assert_eq!(report[89], 0xFA);
+    }
+
+    #[test]
+    fn rgb_wave_speed_byte() {
+        // args: varstore, led, effect 4, direction, speed
+        let report = rgb::wave(rgb::WaveDirection::Left, 0x28).to_report();
+        assert_eq!(&report[9..=13], &[0x01, 0x00, 0x04, 0x01, 0x28]);
+        let report = rgb::wave(rgb::WaveDirection::Right, 0x10).to_report();
+        assert_eq!(&report[9..=13], &[0x01, 0x00, 0x04, 0x02, 0x10]);
+    }
+
+    #[test]
+    fn rgb_custom_frame_layout() {
+        // openrazer razer_chroma_extended_matrix_set_custom_frame2 with
+        // dynamic packet length: class 0x0f, cmd 0x03, ds = 3*len + 5,
+        // args [0, 0, row, start, stop, rgb...].
+        let report = rgb::custom_frame(2, &[(1, 2, 3), (4, 5, 6)]).to_report();
+        assert_eq!(report[2], 0x1F); // transaction id
+        assert_eq!(report[6], 11); // data size = 2*3 + 5
+        assert_eq!(report[7], 0x0F);
+        assert_eq!(report[8], 0x03);
+        assert_eq!(&report[9..=13], &[0x00, 0x00, 0x00, 2, 3]); // row 0, cols 2-3
+        assert_eq!(&report[14..=19], &[1, 2, 3, 4, 5, 6]);
+
+        // A full 18-LED frame: ds = 59, stop col 17.
+        let full = vec![(0xAA, 0xBB, 0xCC); rgb::NUM_LEDS];
+        let report = rgb::custom_frame(0, &full).to_report();
+        assert_eq!(report[6], 59);
+        assert_eq!(&report[9..=13], &[0x00, 0x00, 0x00, 0, 17]);
+    }
+
+    #[test]
+    fn rgb_custom_apply_layout() {
+        // openrazer razer_chroma_extended_matrix_effect_custom_frame:
+        // NOSTORE, ZERO_LED, effect 0x08, ds 0x0C.
+        let report = rgb::custom_apply().to_report();
+        assert_eq!(report[2], 0x1F);
+        assert_eq!(report[6], 0x0C);
+        assert_eq!(report[7], 0x0F);
+        assert_eq!(report[8], 0x02);
+        assert_eq!(&report[9..=11], &[0x00, 0x00, 0x08]);
+    }
+
+    #[test]
+    fn device_mode_layout() {
+        // openrazer razer_chroma_standard_set_device_mode: class 0x00,
+        // cmd 0x04, ds 0x02, args [mode, 0x00].
+        let report = rgb::device_mode(0x03).to_report();
+        assert_eq!(report[6], 0x02);
+        assert_eq!(report[7], 0x00);
+        assert_eq!(report[8], 0x04);
+        assert_eq!(&report[9..=10], &[0x03, 0x00]);
     }
 
     #[test]

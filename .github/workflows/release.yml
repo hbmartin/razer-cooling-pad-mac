@@ -1,0 +1,56 @@
+# Tag a release (git tag v0.2.0 && git push --tags) to build a universal
+# (arm64 + x86_64) macOS binary on the self-hosted macOS runner and attach
+# it to a GitHub release. The binary is ad-hoc signed; swap in a Developer
+# ID identity + notarization once signing secrets are configured.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: universal macOS binary (self-hosted)
+    runs-on: [self-hosted, macOS]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Ensure targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+      - name: Create universal binary
+        run: |
+          mkdir -p dist
+          lipo -create \
+            target/aarch64-apple-darwin/release/padctl \
+            target/x86_64-apple-darwin/release/padctl \
+            -output dist/padctl
+          codesign --force -s - dist/padctl
+          dist/padctl --version
+      - name: Package
+        run: |
+          cd dist
+          tar czf "padctl-${GITHUB_REF_NAME}-macos-universal.tar.gz" padctl
+          shasum -a 256 "padctl-${GITHUB_REF_NAME}-macos-universal.tar.gz" \
+            > "padctl-${GITHUB_REF_NAME}-macos-universal.tar.gz.sha256"
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/padctl-*.tar.gz
+            dist/padctl-*.tar.gz.sha256
+          generate_release_notes: true

@@ -1,4 +1,4 @@
-//! CPU temperature reading on macOS.
+//! macOS CPU temperature reading.
 //!
 //! Primary source: SMC temperature sensors exposed through the private
 //! `IOHIDEventSystemClient` API (usage page 0xff00, usage 5) — the same
@@ -13,6 +13,8 @@ use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
 use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
 use std::ffi::c_void;
+
+use super::Reading;
 
 // kHIDPage_AppleVendor / kHIDUsage_AppleVendor_TemperatureSensor
 const APPLE_VENDOR_PAGE: i32 = 0xff00;
@@ -61,19 +63,25 @@ unsafe extern "C" {
     fn objc_msgSend(receiver: *mut Opaque, sel: *mut Opaque, ...) -> *mut Opaque;
 }
 
-pub enum TempSource {
+enum TempSource {
     /// Averaged CPU die sensors, degrees Celsius.
     SmcSensors,
     /// NSProcessInfo.thermalState mapped to a coarse estimate.
     ThermalPressure,
 }
 
-pub struct TempReader {
+pub struct Reader {
     client: IOHIDEventSystemClientRef,
-    pub source: TempSource,
+    source: TempSource,
 }
 
-impl TempReader {
+/// Apple Silicon CPU-core die sensors are named like
+/// "pACC MTR Temp Sensor4" (P-cores) / "eACC MTR Temp Sensor1" (E-cores).
+fn is_cpu_die_sensor(name: &str) -> bool {
+    name.contains("MTR Temp Sensor")
+}
+
+impl Reader {
     pub fn new() -> Result<Self> {
         let client = unsafe { IOHIDEventSystemClientCreate(kCFAllocatorDefault as *const c_void) };
         if !client.is_null() {
@@ -90,31 +98,67 @@ impl TempReader {
             unsafe {
                 IOHIDEventSystemClientSetMatching(client, matching.as_concrete_TypeRef());
             }
-            let reader = TempReader {
+            let reader = Reader {
                 client,
                 source: TempSource::SmcSensors,
             };
             // Only commit to the SMC source if it actually yields sensors.
-            if reader.read_smc().is_ok() {
+            if reader.read().is_ok() {
                 return Ok(reader);
             }
         }
         // Fall back to thermal pressure (public API), which always works.
-        Ok(TempReader {
+        Ok(Reader {
             client: std::ptr::null_mut(),
             source: TempSource::ThermalPressure,
         })
     }
 
-    /// Current CPU temperature estimate in °C.
     pub fn read(&self) -> Result<f64> {
         match self.source {
-            TempSource::SmcSensors => self.read_smc(),
+            TempSource::SmcSensors => {
+                let readings = self.smc_readings()?;
+                let cpu: Vec<f64> = readings
+                    .iter()
+                    .filter(|r| is_cpu_die_sensor(&r.name))
+                    .map(|r| r.celsius)
+                    .collect();
+                let temps: Vec<f64> = if cpu.is_empty() {
+                    readings.iter().map(|r| r.celsius).collect()
+                } else {
+                    cpu
+                };
+                if temps.is_empty() {
+                    bail!("no usable temperature sensors");
+                }
+                Ok(temps.iter().sum::<f64>() / temps.len() as f64)
+            }
             TempSource::ThermalPressure => read_thermal_pressure(),
         }
     }
 
-    fn read_smc(&self) -> Result<f64> {
+    pub fn source_name(&self) -> &'static str {
+        match self.source {
+            TempSource::SmcSensors => "SMC die sensors",
+            TempSource::ThermalPressure => "thermal pressure (coarse fallback)",
+        }
+    }
+
+    pub fn sensors(&self) -> Result<Vec<Reading>> {
+        match self.source {
+            TempSource::SmcSensors => {
+                let mut readings = self.smc_readings()?;
+                readings.sort_by(|a, b| a.name.cmp(&b.name));
+                Ok(readings)
+            }
+            TempSource::ThermalPressure => Ok(vec![Reading {
+                name: "thermal pressure estimate".into(),
+                celsius: read_thermal_pressure()?,
+            }]),
+        }
+    }
+
+    fn smc_readings(&self) -> Result<Vec<Reading>> {
         if self.client.is_null() {
             bail!("no IOHIDEventSystemClient");
         }
@@ -126,13 +170,13 @@ impl TempReader {
             unsafe { CFArray::wrap_under_create_rule(services as _) };
 
         let product_key = CFString::from_static_string("Product");
-        let mut cpu_temps = Vec::new();
-        let mut all_temps = Vec::new();
+        let mut readings = Vec::new();
 
         for service in services.iter() {
             let service = *service as IOHIDServiceClientRef;
             let name = unsafe {
-                let prop = IOHIDServiceClientCopyProperty(service, product_key.as_concrete_TypeRef());
+                let prop =
+                    IOHIDServiceClientCopyProperty(service, product_key.as_concrete_TypeRef());
                 if prop.is_null() {
                     continue;
                 }
@@ -152,23 +196,20 @@ impl TempReader {
             if !(0.0..=125.0).contains(&value) {
                 continue;
             }
-            // Apple Silicon CPU-core die sensors are named like
-            // "pACC MTR Temp Sensor4" (P-cores) / "eACC MTR Temp Sensor1" (E-cores).
-            if name.contains("MTR Temp Sensor") {
-                cpu_temps.push(value);
-            }
-            all_temps.push(value);
+            readings.push(Reading {
+                name,
+                celsius: value,
+            });
         }
 
-        let temps = if !cpu_temps.is_empty() { &cpu_temps } else { &all_temps };
-        if temps.is_empty() {
+        if readings.is_empty() {
             bail!("no usable temperature sensors");
         }
-        Ok(temps.iter().sum::<f64>() / temps.len() as f64)
+        Ok(readings)
     }
 }
 
-impl Drop for TempReader {
+impl Drop for Reader {
     fn drop(&mut self) {
         if !self.client.is_null() {
             unsafe { CFRelease(self.client as CFTypeRef) };
@@ -177,7 +218,7 @@ impl Drop for TempReader {
 }
 
 // SAFETY: the client is only used from the curve loop's single thread.
-unsafe impl Send for TempReader {}
+unsafe impl Send for Reader {}
 
 /// NSProcessInfo.processInfo.thermalState mapped to coarse °C estimates
 /// chosen to hit sensible points on the default fan curve.
@@ -187,7 +228,10 @@ fn read_thermal_pressure() -> Result<f64> {
         if cls.is_null() {
             bail!("NSProcessInfo unavailable");
         }
-        let process_info = objc_msgSend(cls, sel_registerName(c"processInfo".to_bytes_with_nul().as_ptr()));
+        let process_info = objc_msgSend(
+            cls,
+            sel_registerName(c"processInfo".to_bytes_with_nul().as_ptr()),
+        );
         objc_msgSend(
             process_info,
             sel_registerName(c"thermalState".to_bytes_with_nul().as_ptr()),
@@ -200,11 +244,4 @@ fn read_thermal_pressure() -> Result<f64> {
         2 => 82.0,
         _ => 95.0,
     })
-}
-
-pub fn source_name(source: &TempSource) -> &'static str {
-    match source {
-        TempSource::SmcSensors => "SMC die sensors",
-        TempSource::ThermalPressure => "thermal pressure (coarse fallback)",
-    }
 }
