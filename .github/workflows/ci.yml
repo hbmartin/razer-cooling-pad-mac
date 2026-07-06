@@ -1,0 +1,58 @@
+# Build and test. Everything that can run on Linux does (GitHub-hosted
+# runner); the macOS-specific code paths (IOKit temperature source, launchd
+# service, the mac hidapi backend) build and test on a self-hosted macOS
+# runner — register one under Settings → Actions → Runners with the default
+# "self-hosted" and "macOS" labels.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-linux:
+    name: build & test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install libudev (hidapi build dependency)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo build --locked --all-targets
+      - run: cargo test --locked
+
+  test-macos:
+    name: build & test (macOS, self-hosted)
+    runs-on: [self-hosted, macOS]
+    # Never run fork PRs on the self-hosted runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Ensure clippy
+        run: rustup component add clippy
+      # macOS-only modules are invisible to the Linux clippy job, so lint
+      # them here too.
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked --release

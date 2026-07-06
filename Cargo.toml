@@ -1,18 +1,31 @@
 [package]
 name = "padctl"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
 description = "CLI to control the fans and lights of a Razer Laptop Cooling Pad on macOS"
 license = "MIT"
+repository = "https://github.com/hbmartin/razer-cooling-pad-mac"
+readme = "README.md"
+keywords = ["razer", "cooling-pad", "hid", "fan-control", "macos"]
+categories = ["command-line-utilities", "hardware-support"]
 
 [dependencies]
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
-ctrlc = "3"
-hidapi = { version = "2.6", default-features = false, features = ["macos-shared-device"] }
+clap_complete = "4"
+clap_mangen = "0.2"
+ctrlc = { version = "3", features = ["termination"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
+hidapi = { version = "2.6", default-features = false, features = ["macos-shared-device"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+hidapi = { version = "2.6", default-features = false, features = ["linux-static-hidraw"] }
 
 [profile.release]
 lto = true
