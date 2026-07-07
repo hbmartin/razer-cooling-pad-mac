@@ -2,7 +2,7 @@
 //! service: `~/.config/padctl/config.toml` (respects `XDG_CONFIG_HOME`).
 //! CLI flags always take precedence over config values.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -122,6 +122,39 @@ pub fn load() -> Result<Option<Config>> {
     Ok(Some(config))
 }
 
+/// Persist live-tuned curve values into the config file, keeping existing
+/// comments and unrelated sections (e.g. `[lighting]`) intact. A missing
+/// file is created from the commented template first.
+pub fn save_curve_tuning(points_text: &str, smooth: f64, down_delay: u64) -> Result<PathBuf> {
+    let path = path();
+    save_curve_tuning_to(&path, points_text, smooth, down_delay)?;
+    Ok(path)
+}
+
+// Path-parameterized so tests can target a scratch directory.
+fn save_curve_tuning_to(
+    path: &Path,
+    points_text: &str,
+    smooth: f64,
+    down_delay: u64,
+) -> Result<()> {
+    let text = if path.exists() {
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
+    } else {
+        TEMPLATE.to_string()
+    };
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("parsing {}", path.display()))?;
+    doc["curve"]["points"] = toml_edit::value(points_text);
+    doc["curve"]["smooth"] = toml_edit::value(smooth);
+    doc["curve"]["down_delay"] = toml_edit::value(down_delay as i64);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
+}
+
 /// Write the commented template config, refusing to clobber an existing file
 /// unless `force` is set.
 pub fn init(force: bool) -> Result<PathBuf> {
@@ -185,6 +218,60 @@ mod tests {
         assert_eq!(c.lighting.wave_dir.as_deref(), Some("left"));
         assert_eq!(c.lighting.wave_speed, Some(40));
         assert_eq!(c.lighting.driver_mode, None);
+    }
+
+    /// A scratch file path that is cleaned up when dropped.
+    struct ScratchFile(PathBuf);
+
+    impl ScratchFile {
+        fn new(test: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("padctl-test-{}-{test}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            ScratchFile(dir.join("config.toml"))
+        }
+    }
+
+    impl Drop for ScratchFile {
+        fn drop(&mut self) {
+            if let Some(dir) = self.0.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    #[test]
+    fn save_creates_file_from_template_and_reloads() {
+        let scratch = ScratchFile::new("save-creates");
+        save_curve_tuning_to(&scratch.0, "50:800,80:3000", 12.0, 45).unwrap();
+
+        let text = std::fs::read_to_string(&scratch.0).unwrap();
+        // Template comments survive as documentation.
+        assert!(text.contains("# padctl configuration."));
+        let c: Config = toml::from_str(&text).unwrap();
+        assert_eq!(c.curve.points.as_deref(), Some("50:800,80:3000"));
+        assert_eq!(c.curve.smooth, Some(12.0));
+        assert_eq!(c.curve.down_delay, Some(45));
+    }
+
+    #[test]
+    fn save_preserves_existing_lighting_and_comments() {
+        let scratch = ScratchFile::new("save-preserves");
+        std::fs::write(
+            &scratch.0,
+            "# my precious comment\n[curve]\ninterval = 10\n\n[lighting]\neffect = \"wave\"\n",
+        )
+        .unwrap();
+        save_curve_tuning_to(&scratch.0, "60:1000", 0.0, 0).unwrap();
+
+        let text = std::fs::read_to_string(&scratch.0).unwrap();
+        assert!(text.contains("# my precious comment"));
+        let c: Config = toml::from_str(&text).unwrap();
+        assert_eq!(c.curve.points.as_deref(), Some("60:1000"));
+        assert_eq!(c.curve.smooth, Some(0.0));
+        assert_eq!(c.curve.down_delay, Some(0));
+        assert_eq!(c.curve.interval, Some(10)); // untouched key survives
+        assert_eq!(c.lighting.effect.as_deref(), Some("wave"));
     }
 
     #[test]

@@ -34,33 +34,33 @@ pub struct CurveArgs {
     /// Curve points as temp°C:RPM pairs; RPM 0 means fans off
     /// [default: 55:800,65:1500,75:2200,85:3200]
     #[arg(long)]
-    points: Option<String>,
+    pub(crate) points: Option<String>,
 
     /// Seconds between temperature polls [default: 5]
     #[arg(long)]
-    interval: Option<u64>,
+    pub(crate) interval: Option<u64>,
 
     /// What to do with the fans when the curve stops [default: off]
     #[arg(long, value_enum)]
-    on_exit: Option<OnExit>,
+    pub(crate) on_exit: Option<OnExit>,
 
     /// Temperature smoothing time constant in seconds; 0 disables
     /// [default: 15]
     #[arg(long)]
-    smooth: Option<f64>,
+    pub(crate) smooth: Option<f64>,
 
     /// Seconds a lower target must persist before slowing down (spin-up is
     /// always immediate; 0 slows down immediately) [default: 30]
     #[arg(long)]
-    down_delay: Option<u64>,
+    pub(crate) down_delay: Option<u64>,
 
     /// Print decisions without sending anything to the pad
     #[arg(long)]
-    dry_run: bool,
+    pub(crate) dry_run: bool,
 
     /// Ignore ~/.config/padctl/config.toml
     #[arg(long)]
-    no_config: bool,
+    pub(crate) no_config: bool,
 }
 
 /// Only push a new speed when the target moves at least this much.
@@ -210,7 +210,7 @@ impl Ema {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Decision {
+pub(crate) enum Decision {
     /// Push the target to the pad now.
     Send,
     /// Nothing to do; target is close enough to what's running.
@@ -283,7 +283,106 @@ impl Governor {
     }
 }
 
-fn rpm_text(rpm: u32) -> String {
+/// Everything one control step computed, for logging or display.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TickOutcome {
+    /// Sensor reading, °C.
+    pub(crate) raw: f64,
+    /// EMA output, °C.
+    pub(crate) smoothed: f64,
+    /// Normalized target: 0 = off, otherwise MIN_RPM..=MAX_RPM in 50-steps.
+    pub(crate) target: u32,
+    pub(crate) decision: Decision,
+}
+
+/// The per-tick control step shared by `curve` and `watch`: EMA smoothing,
+/// curve interpolation, device-range normalization, and governor gating.
+pub(crate) struct Controller {
+    points: Vec<(f64, u32)>,
+    ema: Ema,
+    governor: Governor,
+}
+
+impl Controller {
+    pub(crate) fn new(points: Vec<(f64, u32)>, smooth: f64, down_delay: Duration) -> Self {
+        Controller {
+            points,
+            ema: Ema::new(smooth),
+            governor: Governor::new(HYSTERESIS_RPM, down_delay),
+        }
+    }
+
+    /// One control step. `dt` is the seconds elapsed since the previous
+    /// tick; `now` is injected for testability.
+    pub(crate) fn tick(&mut self, raw: f64, dt: f64, now: Instant) -> TickOutcome {
+        let smoothed = self.ema.update(raw, dt);
+        let raw_target = target_rpm(&self.points, smoothed);
+        // Below the device minimum means off.
+        let target = if raw_target < fan::MIN_RPM {
+            0
+        } else {
+            fan::normalize_rpm(raw_target)
+        };
+        TickOutcome {
+            raw,
+            smoothed,
+            target,
+            decision: self.governor.decide(target, now),
+        }
+    }
+
+    /// Record that `target` was actually applied to the device.
+    pub(crate) fn confirm(&mut self, target: u32) {
+        self.governor.confirm(target);
+    }
+
+    /// The last speed actually applied to the device, if any.
+    pub(crate) fn applied(&self) -> Option<u32> {
+        self.governor.applied()
+    }
+
+    /// Forget device state (after a reconnect the pad may run any speed).
+    pub(crate) fn reset(&mut self) {
+        self.governor.reset();
+    }
+}
+
+/// Live-tuning mutators, for adjusting the running curve interactively.
+impl Controller {
+    /// Change the smoothing time constant without disturbing the current
+    /// smoothed value: the line just starts converging faster or slower.
+    pub(crate) fn set_smooth(&mut self, tau: f64) {
+        self.ema.tau = tau;
+    }
+
+    pub(crate) fn smooth(&self) -> f64 {
+        self.ema.tau
+    }
+
+    /// Change the spin-down delay. A shorter delay applies retroactively to
+    /// an in-flight pending spin-down on the next tick — desired when tuning
+    /// live.
+    pub(crate) fn set_down_delay(&mut self, delay: Duration) {
+        self.governor.down_delay = delay;
+    }
+
+    pub(crate) fn down_delay(&self) -> Duration {
+        self.governor.down_delay
+    }
+
+    /// Swap the curve. Governor state is kept so hysteresis and down-delay
+    /// mediate the transition to the new curve exactly as if the
+    /// temperature had moved.
+    pub(crate) fn set_points(&mut self, points: Vec<(f64, u32)>) {
+        self.points = points;
+    }
+
+    pub(crate) fn points(&self) -> &[(f64, u32)] {
+        &self.points
+    }
+}
+
+pub(crate) fn rpm_text(rpm: u32) -> String {
     if rpm == 0 {
         "off".to_string()
     } else {
@@ -335,8 +434,11 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
 
     let mut pad: Option<Pad> = None;
     let mut outage_reported = false;
-    let mut ema = Ema::new(s.smooth);
-    let mut governor = Governor::new(HYSTERESIS_RPM, Duration::from_secs(s.down_delay));
+    let mut controller = Controller::new(
+        s.points.clone(),
+        s.smooth,
+        Duration::from_secs(s.down_delay),
+    );
     let mut pending_reported = false;
     let mut last_status_log = Instant::now();
 
@@ -360,7 +462,7 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                         }
                     }
                     pad = Some(p);
-                    governor.reset();
+                    controller.reset();
                 }
                 Err(e) => {
                     if !outage_reported {
@@ -374,18 +476,10 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
 
         match reader.read() {
             Ok(raw) => {
-                let temp = ema.update(raw, s.interval as f64);
-                let raw_target = target_rpm(&s.points, temp);
-                // Below the device minimum means off.
-                let target = if raw_target < fan::MIN_RPM {
-                    0
-                } else {
-                    fan::normalize_rpm(raw_target)
-                };
-
-                let decision = governor.decide(target, Instant::now());
+                let out = controller.tick(raw, s.interval as f64, Instant::now());
+                let (temp, target, decision) = (out.smoothed, out.target, out.decision);
                 let detail = if s.smooth > 0.0 {
-                    format!(" (raw {raw:.1}°C)")
+                    format!(" (raw {:.1}°C)", out.raw)
                 } else {
                     String::new()
                 };
@@ -408,7 +502,7 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                         if last_status_log.elapsed() >= HEARTBEAT {
                             log::info!(
                                 "{temp:5.1}°C, fan {} (heartbeat)",
-                                rpm_text(governor.applied().unwrap_or(target)),
+                                rpm_text(controller.applied().unwrap_or(target)),
                             );
                             last_status_log = Instant::now();
                         } else {
@@ -419,7 +513,7 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
 
                 if decision == Decision::Send {
                     if args.dry_run {
-                        governor.confirm(target);
+                        controller.confirm(target);
                     } else if let Some(p) = &pad {
                         let result = if target == 0 {
                             p.send(&fan::off())
@@ -427,7 +521,7 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                             p.send(&fan::set_rpm(target))
                         };
                         match result {
-                            Ok(()) => governor.confirm(target),
+                            Ok(()) => controller.confirm(target),
                             Err(e) => {
                                 log::warn!("failed to set fan: {e:#} — will reconnect");
                                 pad = None;
@@ -630,6 +724,114 @@ mod tests {
         let now = Instant::now();
         g.confirm(2000);
         assert_eq!(g.decide(1000, now), Decision::Send);
+    }
+
+    #[test]
+    fn controller_first_tick_sends_and_normalizes() {
+        let points = parse_points("55:800,65:1500,75:2200,85:3200").unwrap();
+        let mut c = Controller::new(points, 0.0, Duration::from_secs(30));
+        let now = Instant::now();
+
+        let out = c.tick(60.0, 5.0, now);
+        assert_eq!(out.raw, 60.0);
+        assert_eq!(out.smoothed, 60.0); // tau 0 = passthrough
+        assert_eq!(out.target, 1150); // interpolated, already on the 50-step
+        assert_eq!(out.decision, Decision::Send);
+
+        // Interpolated targets land on the device's 50 RPM step.
+        let out = c.tick(60.1, 5.0, now);
+        assert_eq!(out.target % fan::RPM_STEP, 0);
+    }
+
+    #[test]
+    fn controller_below_min_rpm_means_off() {
+        let points = parse_points("45:0,60:1000").unwrap();
+        let mut c = Controller::new(points, 0.0, Duration::ZERO);
+        // Interpolation at 50°C gives < MIN_RPM, normalized to off.
+        let out = c.tick(50.0, 5.0, Instant::now());
+        assert_eq!(out.target, 0);
+    }
+
+    #[test]
+    fn controller_pending_down_then_send() {
+        let points = parse_points("55:800,85:3200").unwrap();
+        let mut c = Controller::new(points, 0.0, Duration::from_secs(30));
+        let t0 = Instant::now();
+        c.tick(80.0, 5.0, t0);
+        c.confirm(2800);
+
+        let out = c.tick(60.0, 5.0, t0 + Duration::from_secs(5));
+        assert_eq!(out.decision, Decision::PendingDown);
+        let out = c.tick(60.0, 5.0, t0 + Duration::from_secs(40));
+        assert_eq!(out.decision, Decision::Send);
+    }
+
+    #[test]
+    fn controller_set_down_delay_shorter_releases_pending() {
+        let points = parse_points("55:800,85:3200").unwrap();
+        let mut c = Controller::new(points, 0.0, Duration::from_secs(30));
+        let t0 = Instant::now();
+        c.tick(80.0, 5.0, t0);
+        c.confirm(2800);
+        assert_eq!(c.tick(60.0, 5.0, t0).decision, Decision::PendingDown);
+
+        // 10s in, the 30s delay would still be pending; shortening it to 5s
+        // releases the spin-down on the next tick.
+        c.set_down_delay(Duration::from_secs(5));
+        assert_eq!(c.down_delay(), Duration::from_secs(5));
+        let out = c.tick(60.0, 5.0, t0 + Duration::from_secs(10));
+        assert_eq!(out.decision, Decision::Send);
+    }
+
+    #[test]
+    fn controller_set_smooth_changes_convergence() {
+        let points = parse_points("55:800,85:3200").unwrap();
+        let mut c = Controller::new(points, 1000.0, Duration::ZERO);
+        let now = Instant::now();
+        c.tick(50.0, 5.0, now);
+
+        // Huge tau: barely moves toward a hotter sample.
+        let out = c.tick(80.0, 5.0, now);
+        assert!(out.smoothed < 51.0);
+
+        // Passthrough after disabling smoothing; the EMA value is preserved
+        // until the next sample overwrites it.
+        c.set_smooth(0.0);
+        assert_eq!(c.smooth(), 0.0);
+        let out = c.tick(80.0, 5.0, now);
+        assert_eq!(out.smoothed, 80.0);
+    }
+
+    #[test]
+    fn controller_set_points_reroutes_target_through_governor() {
+        let points = parse_points("55:800,85:3200").unwrap();
+        let mut c = Controller::new(points, 0.0, Duration::from_secs(30));
+        let now = Instant::now();
+        let out = c.tick(70.0, 5.0, now);
+        c.confirm(out.target);
+
+        // A hotter curve raises the target at the same temperature; the
+        // governor treats it like any other spin-up: immediate.
+        c.set_points(parse_points("55:2000,85:3200").unwrap());
+        assert_eq!(c.points().first().unwrap().1, 2000);
+        let out = c.tick(70.0, 5.0, now);
+        assert!(out.target > 2000);
+        assert_eq!(out.decision, Decision::Send);
+    }
+
+    #[test]
+    fn controller_reset_forces_resend() {
+        let points = parse_points("55:800,85:3200").unwrap();
+        let mut c = Controller::new(points, 0.0, Duration::from_secs(30));
+        let now = Instant::now();
+        let out = c.tick(70.0, 5.0, now);
+        c.confirm(out.target);
+        assert_eq!(c.applied(), Some(out.target));
+        assert_eq!(c.tick(70.0, 5.0, now).decision, Decision::Hold);
+
+        c.reset();
+        assert_eq!(c.applied(), None);
+        assert_eq!(c.tick(70.0, 5.0, now).decision, Decision::Send);
     }
 
     #[test]
