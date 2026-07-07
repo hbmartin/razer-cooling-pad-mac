@@ -45,6 +45,12 @@ impl TempReader {
         self.inner.source_name()
     }
 
+    /// Whether the active source is a coarse fallback (e.g. thermal-pressure
+    /// estimates) rather than real sensors. Surfaced by `padctl doctor`.
+    pub fn is_fallback(&self) -> bool {
+        self.inner.is_fallback()
+    }
+
     /// All individual sensors the active source can see.
     pub fn sensors(&self) -> Result<Vec<Reading>> {
         self.inner.sensors()

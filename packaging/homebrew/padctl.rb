@@ -13,7 +13,7 @@
 class Padctl < Formula
   desc "Control the fans and lights of a Razer Laptop Cooling Pad"
   homepage "https://github.com/hbmartin/razer-cooling-pad-mac"
-  url "https://github.com/hbmartin/razer-cooling-pad-mac/archive/refs/tags/v0.3.0.tar.gz"
+  url "https://github.com/hbmartin/razer-cooling-pad-mac/archive/refs/tags/v0.4.0.tar.gz"
   sha256 "" # filled in per release by the release workflow
   license "MIT"
   head "https://github.com/hbmartin/razer-cooling-pad-mac.git", branch: "main"

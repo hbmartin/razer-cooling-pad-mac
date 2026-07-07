@@ -97,6 +97,10 @@ impl Reader {
         "sysfs thermal zones"
     }
 
+    pub fn is_fallback(&self) -> bool {
+        false
+    }
+
     pub fn sensors(&self) -> Result<Vec<Reading>> {
         let readings: Vec<Reading> = self
             .zones

@@ -144,6 +144,10 @@ impl Reader {
         }
     }
 
+    pub fn is_fallback(&self) -> bool {
+        matches!(self.source, TempSource::ThermalPressure)
+    }
+
     pub fn sensors(&self) -> Result<Vec<Reading>> {
         match self.source {
             TempSource::SmcSensors => {
