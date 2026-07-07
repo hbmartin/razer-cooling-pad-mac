@@ -5,6 +5,10 @@
 //! MaxFeatureReportSize=90); interface 1 carries media-key input events and
 //! must never be opened (it belongs to Apple's HID event driver, and opening
 //! it can trip the Input Monitoring permission gate).
+//!
+//! [`Pad`] owns the command sequencing (inter-command pacing, busy retries,
+//! `--verify` echo checks) and talks to the device through the [`Transport`]
+//! trait, so that logic is unit-testable against a scripted fake.
 
 use std::thread::sleep;
 use std::time::Duration;
@@ -19,13 +23,47 @@ pub const PID: u16 = 0x0F43;
 
 /// Pause between consecutive commands; Razer firmware can wedge on
 /// rapid back-to-back feature reports.
+#[cfg(not(test))]
 const INTER_COMMAND_DELAY: Duration = Duration::from_millis(50);
+#[cfg(test)]
+const INTER_COMMAND_DELAY: Duration = Duration::from_millis(1);
 /// Wait between sending a 0x8x query and reading its response.
+#[cfg(not(test))]
 const QUERY_DELAY: Duration = Duration::from_millis(100);
+#[cfg(test)]
+const QUERY_DELAY: Duration = Duration::from_millis(1);
 const BUSY_RETRIES: u32 = 3;
 
 pub fn api() -> Result<HidApi> {
     HidApi::new().context("initializing hidapi")
+}
+
+/// Raw feature-report exchange with the device. Implemented by [`HidDevice`]
+/// for real hardware and by scripted fakes in tests.
+pub trait Transport {
+    /// Send a full 91-byte feature report (report id + packet).
+    fn send_report(&self, report: &[u8; REPORT_LEN]) -> Result<()>;
+    /// Read the device's current 91-byte feature report.
+    fn read_report(&self) -> Result<[u8; REPORT_LEN]>;
+}
+
+impl Transport for HidDevice {
+    fn send_report(&self, report: &[u8; REPORT_LEN]) -> Result<()> {
+        self.send_feature_report(report)
+            .context("sending feature report")?;
+        Ok(())
+    }
+
+    fn read_report(&self) -> Result<[u8; REPORT_LEN]> {
+        let mut buf = [0u8; REPORT_LEN];
+        let n = self
+            .get_feature_report(&mut buf)
+            .context("reading feature report")?;
+        if n < REPORT_LEN - 1 {
+            bail!("short feature report: {n} bytes, expected {REPORT_LEN}");
+        }
+        Ok(buf)
+    }
 }
 
 /// Narrow device discovery to a specific pad when several are connected.
@@ -65,8 +103,6 @@ impl Selector {
 /// How to open the pad; carried by every command from the global CLI flags.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpenOpts {
-    /// Print raw packets sent/received.
-    pub verbose: bool,
     /// After each command, read back the device status and fail loudly if
     /// the device rejected it (best effort: skipped when the device does
     /// not echo the command).
@@ -83,8 +119,7 @@ fn candidates<'a>(api: &'a HidApi, selector: &Selector) -> Vec<&'a DeviceInfo> {
 }
 
 pub struct Pad {
-    dev: HidDevice,
-    pub verbose: bool,
+    dev: Box<dyn Transport>,
     verify: bool,
 }
 
@@ -111,29 +146,17 @@ impl Pad {
         for info in cands {
             let path = info.path().to_string_lossy().into_owned();
             match api.open_path(info.path()) {
-                Ok(dev) => {
-                    let mut buf = [0u8; REPORT_LEN];
-                    match dev.get_feature_report(&mut buf) {
-                        Ok(n) if n >= REPORT_LEN - 1 => {
-                            if opts.verbose {
-                                eprintln!(
-                                    "opened control interface {} ({})",
-                                    info.interface_number(),
-                                    path
-                                );
-                            }
-                            return Ok(Pad {
-                                dev,
-                                verbose: opts.verbose,
-                                verify: opts.verify,
-                            });
-                        }
-                        Ok(n) => errors.push(format!(
-                            "{path}: feature report is {n} bytes, expected {REPORT_LEN}"
-                        )),
-                        Err(e) => errors.push(format!("{path}: feature read failed: {e}")),
+                Ok(dev) => match Transport::read_report(&dev) {
+                    Ok(_) => {
+                        log::debug!(
+                            "opened control interface {} ({})",
+                            info.interface_number(),
+                            path
+                        );
+                        return Ok(Pad::with_transport(Box::new(dev), opts));
                     }
-                }
+                    Err(e) => errors.push(format!("{path}: {e:#}")),
+                },
                 Err(e) => errors.push(format!("{path}: open failed: {e}")),
             }
         }
@@ -144,6 +167,14 @@ impl Pad {
              replug it, or quit Razer Synapse.",
             errors.join("\n  ")
         ))
+    }
+
+    /// Wrap an already-open transport (tests use this with a scripted fake).
+    pub fn with_transport(dev: Box<dyn Transport>, opts: OpenOpts) -> Pad {
+        Pad {
+            dev,
+            verify: opts.verify,
+        }
     }
 
     /// Send a command packet. With `--verify`, read back the device status
@@ -159,12 +190,8 @@ impl Pad {
 
     /// Send a pre-built 91-byte feature report verbatim (report id + packet).
     pub fn send_report(&self, report: &[u8; REPORT_LEN]) -> Result<()> {
-        if self.verbose {
-            eprintln!("-> {}", hex(&report[1..]));
-        }
-        self.dev
-            .send_feature_report(report)
-            .context("sending feature report")?;
+        log::debug!("-> {}", hex(&report[1..]));
+        self.dev.send_report(report)?;
         sleep(INTER_COMMAND_DELAY);
         Ok(())
     }
@@ -172,17 +199,8 @@ impl Pad {
     /// Read the device's current 91-byte feature report without sending
     /// a request first (the Windows plugin reads RPM this way).
     pub fn read_report(&self) -> Result<[u8; REPORT_LEN]> {
-        let mut buf = [0u8; REPORT_LEN];
-        let n = self
-            .dev
-            .get_feature_report(&mut buf)
-            .context("reading feature report")?;
-        if n < REPORT_LEN - 1 {
-            bail!("short feature report: {n} bytes, expected {REPORT_LEN}");
-        }
-        if self.verbose {
-            eprintln!("<- {}", hex(&buf[1..]));
-        }
+        let buf = self.dev.read_report()?;
+        log::debug!("<- {}", hex(&buf[1..]));
         Ok(buf)
     }
 
@@ -194,13 +212,12 @@ impl Pad {
             let report = self.read_report()?;
             let resp = Response::from_report(&report);
             if resp.class != sent[7] || resp.cmd != sent[8] {
-                if self.verbose {
-                    eprintln!(
-                        "verify: device did not echo the command \
-                         (got class 0x{:02x} cmd 0x{:02x}); skipping check",
-                        resp.class, resp.cmd
-                    );
-                }
+                log::debug!(
+                    "verify: device did not echo the command \
+                     (got class 0x{:02x} cmd 0x{:02x}); skipping check",
+                    resp.class,
+                    resp.cmd
+                );
                 return Ok(());
             }
             match resp.status {
@@ -279,4 +296,154 @@ pub fn hex(bytes: &[u8]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rgb;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    /// Scripted transport: records everything sent, pops pre-scripted reads.
+    #[derive(Default)]
+    struct Script {
+        sent: Vec<[u8; REPORT_LEN]>,
+        reads: VecDeque<[u8; REPORT_LEN]>,
+    }
+
+    #[derive(Clone, Default)]
+    struct Mock(Rc<RefCell<Script>>);
+
+    impl Transport for Mock {
+        fn send_report(&self, report: &[u8; REPORT_LEN]) -> Result<()> {
+            self.0.borrow_mut().sent.push(*report);
+            Ok(())
+        }
+
+        fn read_report(&self) -> Result<[u8; REPORT_LEN]> {
+            self.0
+                .borrow_mut()
+                .reads
+                .pop_front()
+                .context("mock: no more scripted reads")
+        }
+    }
+
+    impl Mock {
+        fn pad(&self, verify: bool) -> Pad {
+            Pad::with_transport(Box::new(self.clone()), OpenOpts { verify })
+        }
+
+        fn script_read(&self, report: [u8; REPORT_LEN]) {
+            self.0.borrow_mut().reads.push_back(report);
+        }
+
+        fn sent_count(&self) -> usize {
+            self.0.borrow().sent.len()
+        }
+    }
+
+    /// A device report echoing `packet`'s class/cmd with the given status.
+    fn echo(packet: &Packet, status: u8) -> [u8; REPORT_LEN] {
+        let mut report = packet.to_report();
+        report[1] = status;
+        report
+    }
+
+    #[test]
+    fn query_returns_matching_response() {
+        let mock = Mock::default();
+        let q = rgb::brightness_get();
+        let mut ok = echo(&q, 0x02);
+        ok[11] = 0xFF; // brightness arg
+        mock.script_read(ok);
+        let resp = mock.pad(false).query(&q).unwrap();
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(resp.args[2], 0xFF);
+        assert_eq!(mock.sent_count(), 1);
+    }
+
+    #[test]
+    fn query_retries_while_busy_then_succeeds() {
+        let mock = Mock::default();
+        let q = rgb::firmware_version();
+        mock.script_read(echo(&q, 0x01)); // busy
+        mock.script_read(echo(&q, 0x01)); // busy
+        mock.script_read(echo(&q, 0x02)); // ok
+        let resp = mock.pad(false).query(&q).unwrap();
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(mock.sent_count(), 3); // the query is re-sent per attempt
+    }
+
+    #[test]
+    fn query_gives_up_after_busy_retries() {
+        let mock = Mock::default();
+        let q = rgb::firmware_version();
+        for _ in 0..=BUSY_RETRIES {
+            mock.script_read(echo(&q, 0x01));
+        }
+        let err = mock.pad(false).query(&q).unwrap_err();
+        assert!(err.to_string().contains("busy"), "{err}");
+    }
+
+    #[test]
+    fn query_rejects_mismatched_echo() {
+        let mock = Mock::default();
+        mock.script_read(echo(&rgb::serial(), 0x02));
+        let err = mock.pad(false).query(&rgb::firmware_version()).unwrap_err();
+        assert!(err.to_string().contains("does not echo"), "{err}");
+    }
+
+    #[test]
+    fn query_fails_on_error_status() {
+        let mock = Mock::default();
+        let q = rgb::firmware_version();
+        mock.script_read(echo(&q, 0x05)); // not supported
+        let err = mock.pad(false).query(&q).unwrap_err();
+        assert!(err.to_string().contains("not supported"), "{err}");
+    }
+
+    #[test]
+    fn send_without_verify_never_reads() {
+        let mock = Mock::default();
+        // No reads scripted: a read attempt would error.
+        mock.pad(false).send(&rgb::spectrum()).unwrap();
+        assert_eq!(mock.sent_count(), 1);
+    }
+
+    #[test]
+    fn verify_accepts_ok_echo() {
+        let mock = Mock::default();
+        let cmd = rgb::spectrum();
+        mock.script_read(echo(&cmd, 0x02));
+        mock.pad(true).send(&cmd).unwrap();
+    }
+
+    #[test]
+    fn verify_retries_busy_echo() {
+        let mock = Mock::default();
+        let cmd = rgb::spectrum();
+        mock.script_read(echo(&cmd, 0x01)); // busy
+        mock.script_read(echo(&cmd, 0x02)); // then ok
+        mock.pad(true).send(&cmd).unwrap();
+    }
+
+    #[test]
+    fn verify_fails_on_rejected_command() {
+        let mock = Mock::default();
+        let cmd = rgb::spectrum();
+        mock.script_read(echo(&cmd, 0x03)); // failure
+        let err = mock.pad(true).send(&cmd).unwrap_err();
+        assert!(err.to_string().contains("rejected"), "{err}");
+    }
+
+    #[test]
+    fn verify_skips_when_device_does_not_echo() {
+        let mock = Mock::default();
+        // Device answers with an unrelated report (e.g. the fan status).
+        mock.script_read(echo(&crate::fan::off(), 0x02));
+        mock.pad(true).send(&rgb::spectrum()).unwrap();
+    }
 }

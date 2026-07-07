@@ -2,6 +2,8 @@ mod config;
 mod curve;
 mod device;
 mod fan;
+mod lighting;
+mod logging;
 mod packet;
 mod parse;
 mod reactive;
@@ -28,7 +30,7 @@ use crate::parse::Speed;
     version
 )]
 struct Cli {
-    /// Print raw packets sent/received
+    /// Debug logging: raw packets sent/received, every curve poll
     #[arg(short, long, global = true)]
     verbose: bool,
 
@@ -59,7 +61,6 @@ impl Cli {
 
     fn open_opts(&self) -> OpenOpts {
         OpenOpts {
-            verbose: self.verbose,
             verify: self.verify,
         }
     }
@@ -80,13 +81,29 @@ enum Cmd {
         cmd: RgbCmd,
     },
     /// Show firmware version and serial number
-    Info,
+    Info {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// One-shot overview: fan, brightness, firmware, serial, CPU temperature
-    Status,
+    Status {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the current CPU temperature reading the fan curve would use
-    Temp,
+    Temp {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// List the temperature sensors visible to padctl
-    Sensors,
+    Sensors {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Send a raw 90-byte packet (hex); advanced/protocol exploration
     Raw {
         /// Hex bytes of the packet, spaces optional (up to 90 bytes; zero-padded)
@@ -126,7 +143,11 @@ enum FanCmd {
     /// Turn the fans off
     Off,
     /// Read the current fan speed
-    Get,
+    Get {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -170,6 +191,8 @@ enum RgbCmd {
     /// Map CPU temperature onto the strip, updating live (Ctrl-C to stop;
     /// experimental on this device)
     Thermal(reactive::ThermalArgs),
+    /// Apply the [lighting] section of ~/.config/padctl/config.toml
+    Apply,
 }
 
 #[derive(Subcommand)]
@@ -195,6 +218,8 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    logging::init(cli.verbose);
+
     // Commands that don't touch the device (or manage it themselves).
     match &cli.cmd {
         Cmd::Completions { shell } => {
@@ -215,16 +240,36 @@ fn run(cli: Cli) -> Result<()> {
                 .context("writing man page")?;
             return Ok(());
         }
-        Cmd::Temp => {
+        Cmd::Temp { json } => {
             let reader = temp::TempReader::new()?;
-            println!("{:.1}°C ({})", reader.read()?, reader.source_name());
+            let celsius = reader.read()?;
+            if *json {
+                print_json(&serde_json::json!({
+                    "celsius": celsius,
+                    "source": reader.source_name(),
+                }))?;
+            } else {
+                println!("{celsius:.1}°C ({})", reader.source_name());
+            }
             return Ok(());
         }
-        Cmd::Sensors => {
+        Cmd::Sensors { json } => {
             let reader = temp::TempReader::new()?;
-            println!("source: {}", reader.source_name());
-            for r in reader.sensors()? {
-                println!("{:6.1}°C  {}", r.celsius, r.name);
+            let sensors = reader.sensors()?;
+            if *json {
+                let rows: Vec<serde_json::Value> = sensors
+                    .iter()
+                    .map(|r| serde_json::json!({ "name": r.name, "celsius": r.celsius }))
+                    .collect();
+                print_json(&serde_json::json!({
+                    "source": reader.source_name(),
+                    "sensors": rows,
+                }))?;
+            } else {
+                println!("source: {}", reader.source_name());
+                for r in sensors {
+                    println!("{:6.1}°C  {}", r.celsius, r.name);
+                }
             }
             return Ok(());
         }
@@ -260,6 +305,16 @@ fn run(cli: Cli) -> Result<()> {
                     println!("on exit:      {:?}", s.on_exit);
                     println!("smooth:       {}s", s.smooth);
                     println!("down delay:   {}s", s.down_delay);
+                    let lighting = match &file {
+                        Some(c) => lighting::plan(&c.lighting)?,
+                        None => None,
+                    };
+                    println!(
+                        "lighting:     {}",
+                        lighting
+                            .map(|p| p.summary)
+                            .unwrap_or_else(|| "not configured".into())
+                    );
                 }
             }
             return Ok(());
@@ -299,9 +354,14 @@ fn run(cli: Cli) -> Result<()> {
                     pad.send(&fan::off())?;
                     println!("fan off");
                 }
-                FanCmd::Get => {
+                FanCmd::Get { json } => {
                     let report = pad.read_report()?;
-                    println!("{} RPM", fan::rpm_from_report(&report));
+                    let rpm = fan::rpm_from_report(&report);
+                    if json {
+                        print_json(&serde_json::json!({ "rpm": rpm, "off": rpm == 0 }))?;
+                    } else {
+                        println!("{rpm} RPM");
+                    }
                 }
             }
         }
@@ -381,34 +441,74 @@ fn run(cli: Cli) -> Result<()> {
                     println!("lighting set to gradient");
                 }
                 RgbCmd::Thermal(args) => reactive::run(pad, args)?,
+                RgbCmd::Apply => {
+                    let file = config::load()?.with_context(|| {
+                        format!(
+                            "no config file at {} (run `padctl config init`)",
+                            config::path().display()
+                        )
+                    })?;
+                    let plan = lighting::plan(&file.lighting)?
+                        .context("the config has no [lighting] settings to apply")?;
+                    for packet in &plan.packets {
+                        pad.send(packet)?;
+                    }
+                    println!("lighting applied from config: {}", plan.summary);
+                }
             }
         }
-        Cmd::Info => {
+        Cmd::Info { json } => {
             let pad = Pad::open(&api, &selector, opts)?;
             let fw = pad.query(&rgb::firmware_version())?;
-            println!("firmware: v{}.{}", fw.args[0], fw.args[1]);
             let serial = pad.query(&rgb::serial())?;
-            println!("serial:   {}", serial_text(&serial));
+            if json {
+                print_json(&serde_json::json!({
+                    "firmware": format!("{}.{}", fw.args[0], fw.args[1]),
+                    "serial": serial_text(&serial),
+                }))?;
+            } else {
+                println!("firmware: v{}.{}", fw.args[0], fw.args[1]);
+                println!("serial:   {}", serial_text(&serial));
+            }
         }
-        Cmd::Status => {
+        Cmd::Status { json } => {
             let pad = Pad::open(&api, &selector, opts)?;
             // Read the fan report first: queries overwrite the report buffer.
             let report = pad.read_report()?;
             let rpm = fan::rpm_from_report(&report);
-            if rpm == 0 {
-                println!("fan:        off");
-            } else {
-                println!("fan:        {rpm} RPM (~{}%)", fan::rpm_to_percent(rpm));
-            }
             let brightness = pad.query(&rgb::brightness_get())?;
-            println!("brightness: {}%", brightness.args[2] as u16 * 100 / 255);
+            let brightness_pct = brightness.args[2] as u16 * 100 / 255;
             let fw = pad.query(&rgb::firmware_version())?;
-            println!("firmware:   v{}.{}", fw.args[0], fw.args[1]);
             let serial = pad.query(&rgb::serial())?;
-            println!("serial:     {}", serial_text(&serial));
-            match temp::TempReader::new().and_then(|r| Ok((r.read()?, r.source_name()))) {
-                Ok((t, source)) => println!("cpu temp:   {t:.1}°C ({source})"),
-                Err(e) => println!("cpu temp:   unavailable ({e:#})"),
+            let temp = temp::TempReader::new().and_then(|r| Ok((r.read()?, r.source_name())));
+            if json {
+                let (celsius, source) = match &temp {
+                    Ok((t, s)) => (Some(*t), Some(*s)),
+                    Err(_) => (None, None),
+                };
+                print_json(&serde_json::json!({
+                    "fan_rpm": rpm,
+                    "fan_off": rpm == 0,
+                    "fan_percent": if rpm == 0 { None } else { Some(fan::rpm_to_percent(rpm)) },
+                    "brightness_percent": brightness_pct,
+                    "firmware": format!("{}.{}", fw.args[0], fw.args[1]),
+                    "serial": serial_text(&serial),
+                    "cpu_temp_celsius": celsius,
+                    "temp_source": source,
+                }))?;
+            } else {
+                if rpm == 0 {
+                    println!("fan:        off");
+                } else {
+                    println!("fan:        {rpm} RPM (~{}%)", fan::rpm_to_percent(rpm));
+                }
+                println!("brightness: {brightness_pct}%");
+                println!("firmware:   v{}.{}", fw.args[0], fw.args[1]);
+                println!("serial:     {}", serial_text(&serial));
+                match temp {
+                    Ok((t, source)) => println!("cpu temp:   {t:.1}°C ({source})"),
+                    Err(e) => println!("cpu temp:   unavailable ({e:#})"),
+                }
             }
         }
         Cmd::Raw {
@@ -443,9 +543,14 @@ fn run(cli: Cli) -> Result<()> {
         | Cmd::Service { .. }
         | Cmd::Completions { .. }
         | Cmd::Manpage
-        | Cmd::Temp
-        | Cmd::Sensors => unreachable!(),
+        | Cmd::Temp { .. }
+        | Cmd::Sensors { .. } => unreachable!(),
     }
+    Ok(())
+}
+
+fn print_json(value: &serde_json::Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
 

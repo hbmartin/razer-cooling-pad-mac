@@ -1,10 +1,10 @@
 # Homebrew formula template for padctl.
 #
-# To publish: create a tap repository (github.com/hbmartin/homebrew-tap),
-# copy this file into its Formula/ directory, and fill in sha256 for the
-# tagged tarball:
-#
-#   curl -sL https://github.com/hbmartin/razer-cooling-pad-mac/archive/refs/tags/v0.2.0.tar.gz | shasum -a 256
+# The release workflow (.github/workflows/release.yml) publishes this
+# automatically: on a v* tag it fills in the tagged tarball's url + sha256
+# and pushes the result to github.com/hbmartin/homebrew-tap as
+# Formula/padctl.rb (requires the HOMEBREW_TAP_TOKEN secret). The tap
+# repository just needs to exist.
 #
 # Users then install with:
 #
@@ -13,8 +13,8 @@
 class Padctl < Formula
   desc "Control the fans and lights of a Razer Laptop Cooling Pad"
   homepage "https://github.com/hbmartin/razer-cooling-pad-mac"
-  url "https://github.com/hbmartin/razer-cooling-pad-mac/archive/refs/tags/v0.2.0.tar.gz"
-  sha256 "" # fill in per release, see header comment
+  url "https://github.com/hbmartin/razer-cooling-pad-mac/archive/refs/tags/v0.3.0.tar.gz"
+  sha256 "" # filled in per release by the release workflow
   license "MIT"
   head "https://github.com/hbmartin/razer-cooling-pad-mac.git", branch: "main"
 

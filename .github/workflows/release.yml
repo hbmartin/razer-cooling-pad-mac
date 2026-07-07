@@ -1,7 +1,13 @@
-# Tag a release (git tag v0.2.0 && git push --tags) to build a universal
+# Tag a release (git tag v0.3.0 && git push --tags) to build a universal
 # (arm64 + x86_64) macOS binary on the self-hosted macOS runner and attach
 # it to a GitHub release. The binary is ad-hoc signed; swap in a Developer
 # ID identity + notarization once signing secrets are configured.
+#
+# After the release is created, two optional jobs run on GitHub-hosted
+# runners, each skipped gracefully when its secret is missing:
+#   - publish to crates.io   (secret: CARGO_REGISTRY_TOKEN)
+#   - bump the Homebrew tap  (secret: HOMEBREW_TAP_TOKEN, a PAT with push
+#     access to hbmartin/homebrew-tap)
 name: Release
 
 on:
@@ -54,3 +60,81 @@ jobs:
             dist/padctl-*.tar.gz
             dist/padctl-*.tar.gz.sha256
           generate_release_notes: true
+
+  publish-crate:
+    name: publish to crates.io
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Secrets are not readable in job-level `if`, so gate every step on
+      # this check instead; the job succeeds as a no-op without the token.
+      - name: Check for a crates.io token
+        id: token
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -n "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "have=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CARGO_REGISTRY_TOKEN is not set; skipping the crates.io publish"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.have == 'true'
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.token.outputs.have == 'true'
+      - name: Install libudev (hidapi build dependency)
+        if: steps.token.outputs.have == 'true'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - name: Publish
+        if: steps.token.outputs.have == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+
+  homebrew:
+    name: bump Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check for a tap token
+        id: token
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -n "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "have=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::HOMEBREW_TAP_TOKEN is not set; skipping the Homebrew tap bump"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.have == 'true'
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.have == 'true'
+        with:
+          repository: hbmartin/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Update the formula from the template
+        if: steps.token.outputs.have == 'true'
+        run: |
+          URL="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          SHA=$(curl -sSfL "$URL" | shasum -a 256 | cut -d' ' -f1)
+          mkdir -p tap/Formula
+          sed -e "s|^  url \".*\"$|  url \"${URL}\"|" \
+              -e "s|^  sha256 .*$|  sha256 \"${SHA}\"|" \
+              packaging/homebrew/padctl.rb > tap/Formula/padctl.rb
+      - name: Commit and push
+        if: steps.token.outputs.have == 'true'
+        run: |
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/padctl.rb
+          git diff --cached --quiet || git commit -m "padctl ${GITHUB_REF_NAME}"
+          git push
