@@ -10,6 +10,7 @@ mod reactive;
 mod rgb;
 mod service;
 mod temp;
+mod watch;
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 compile_error!("padctl supports macOS (its primary target) and Linux (protocol work, CI) only");
@@ -117,6 +118,8 @@ enum Cmd {
     },
     /// Run an automatic fan curve from CPU temperature (Ctrl-C to stop)
     Curve(curve::CurveArgs),
+    /// Live dashboard for the fan curve with in-place tuning (q to quit)
+    Watch(curve::CurveArgs),
     /// Manage a launchd agent that runs the fan curve at login (macOS)
     Service {
         #[command(subcommand)]
@@ -218,7 +221,12 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    logging::init(cli.verbose);
+    // The watch TUI owns the terminal: a stderr logger would draw over the
+    // alternate screen, so leave the log facade uninitialized (no-op) and
+    // let the dashboard record events itself.
+    if !matches!(cli.cmd, Cmd::Watch(_)) {
+        logging::init(cli.verbose);
+    }
 
     // Commands that don't touch the device (or manage it themselves).
     match &cli.cmd {
@@ -537,6 +545,9 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Curve(args) => {
             curve::run(&mut api, &selector, opts, args)?;
+        }
+        Cmd::Watch(args) => {
+            watch::run(&mut api, &selector, opts, args, cli.verbose)?;
         }
         // Handled before the device was opened.
         Cmd::Config { .. }

@@ -125,7 +125,6 @@ pub fn load() -> Result<Option<Config>> {
 /// Persist live-tuned curve values into the config file, keeping existing
 /// comments and unrelated sections (e.g. `[lighting]`) intact. A missing
 /// file is created from the commented template first.
-#[allow(dead_code)] // used by `watch` (next commit)
 pub fn save_curve_tuning(points_text: &str, smooth: f64, down_delay: u64) -> Result<PathBuf> {
     let path = path();
     save_curve_tuning_to(&path, points_text, smooth, down_delay)?;

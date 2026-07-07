@@ -89,6 +89,10 @@ padctl curve --points "50:0,60:1200,75:2400,85:3200" --interval 5 --on-exit off
 padctl curve --smooth 15 --down-delay 30
 padctl curve --dry-run             # print decisions without touching the pad
 
+# Live dashboard for the curve, with in-place tuning (same flags as curve)
+padctl watch
+padctl watch --dry-run             # observe/tune without touching the pad
+
 # Protocol exploration: send a raw 90-byte packet (zero-padded)
 padctl raw "00 1f 00 00 00 03 0f 84 01 00" --auto-crc --read
 ```
@@ -126,6 +130,38 @@ The loop is built to run unattended:
   status heartbeat every 10 minutes so the log shows the loop is alive. Run
   with `-v` to see every poll. At the default 5 s poll interval this keeps
   an unattended log file to a few lines per hour instead of thousands.
+
+## Tune it live (`padctl watch`)
+
+`padctl watch` runs the exact same control loop as `padctl curve` (same
+flags, same config file, same smoothing/governor logic) but renders it as a
+live terminal dashboard instead of log lines: raw vs smoothed temperature,
+target vs actual RPM (read back from the pad), the curve shape with the
+current operating point, and a scrolling panel of recent decisions.
+
+Tuning happens in place — no restart cycles:
+
+| Key | Action |
+| --- | --- |
+| `S` / `s` | smoothing time constant +1 s / −1 s (0 disables) |
+| `D` / `d` | spin-down delay +5 s / −5 s (0 disables) |
+| `Tab` / `Shift-Tab` | select a curve point |
+| `↑` / `↓` | selected point RPM ±50 (below 500 snaps to off) |
+| `←` / `→` | selected point temperature ±1 °C |
+| `w` | write the current tuning to `~/.config/padctl/config.toml` |
+| `r` | reset tuning to the startup values |
+| `Space` | pause/resume the control loop |
+| `q` / `Esc` / `Ctrl-C` | quit (honors `--on-exit`, default `off`) |
+
+Changes take effect on the next control tick (forced immediately on every
+keypress). `w` updates only the `[curve]` tuning keys and keeps the rest of
+the config file — comments, `[lighting]` — intact; if you quit with unsaved
+changes, the equivalent `--points/--smooth/--down-delay` flags are printed
+so nothing is lost. With `--dry-run` the dashboard never touches the pad,
+so it's safe to run alongside the launchd service while experimenting
+(without `--dry-run`, stop the service first — two writers would fight
+over the fan). `-v` records every poll in the decisions panel, not just
+decision changes.
 
 ## Run it at login (launchd service)
 

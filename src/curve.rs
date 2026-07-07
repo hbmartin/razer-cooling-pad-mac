@@ -348,7 +348,6 @@ impl Controller {
 }
 
 /// Live-tuning mutators, for adjusting the running curve interactively.
-#[allow(dead_code)] // used by `watch` (next commit)
 impl Controller {
     /// Change the smoothing time constant without disturbing the current
     /// smoothed value: the line just starts converging faster or slower.
