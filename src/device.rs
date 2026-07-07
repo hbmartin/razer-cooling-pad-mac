@@ -169,6 +169,15 @@ impl Pad {
         Ok(())
     }
 
+    /// Send a pre-built report while preserving the global `--verify` behavior.
+    pub fn send_raw_report(&self, report: &[u8; REPORT_LEN]) -> Result<()> {
+        self.send_report(report)?;
+        if self.verify {
+            self.confirm(report)?;
+        }
+        Ok(())
+    }
+
     /// Read the device's current 91-byte feature report without sending
     /// a request first (the Windows plugin reads RPM this way).
     pub fn read_report(&self) -> Result<[u8; REPORT_LEN]> {

@@ -16,6 +16,41 @@ use crate::device::Pad;
 use crate::rgb;
 use crate::temp::TempReader;
 
+struct DriverModeGuard<'a> {
+    pad: &'a Pad,
+    active: bool,
+}
+
+impl<'a> DriverModeGuard<'a> {
+    fn new(pad: &'a Pad) -> Self {
+        Self { pad, active: false }
+    }
+
+    fn activate(&mut self) {
+        self.active = true;
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if self.active {
+            self.pad
+                .send(&rgb::device_mode(0x00))
+                .context("restoring normal device mode")?;
+            self.active = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DriverModeGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            if let Err(e) = self.pad.send(&rgb::device_mode(0x00)) {
+                eprintln!("warning: failed to restore normal device mode: {e:#}");
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Style {
     /// Light 0-18 LEDs like a level meter, green→red
@@ -66,8 +101,10 @@ pub fn run(pad: Pad, args: ThermalArgs) -> Result<()> {
     ctrlc::set_handler(move || r.store(false, Ordering::SeqCst))
         .context("installing signal handler")?;
 
+    let mut driver_mode = DriverModeGuard::new(&pad);
     if args.driver_mode {
         pad.send(&rgb::device_mode(0x03))?;
+        driver_mode.activate();
     }
 
     let mut last_frame: Option<Vec<rgb::Rgb>> = None;
@@ -91,16 +128,14 @@ pub fn run(pad: Pad, args: ThermalArgs) -> Result<()> {
             Err(e) => eprintln!("warning: temperature read failed: {e:#}"),
         }
 
-        let mut remaining = interval * 10;
+        let mut remaining = interval.saturating_mul(10);
         while remaining > 0 && running.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(100));
             remaining -= 1;
         }
     }
 
-    if args.driver_mode {
-        pad.send(&rgb::device_mode(0x00))?;
-    }
+    driver_mode.restore()?;
     println!("\nstopped (lighting left as-is; use `padctl rgb` to change it)");
     Ok(())
 }

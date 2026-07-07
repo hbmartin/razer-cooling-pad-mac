@@ -427,7 +427,7 @@ fn run(cli: Cli) -> Result<()> {
             if auto_crc {
                 report[1 + packet::CRC_OFFSET] = packet::crc(&report[1..]);
             }
-            pad.send_report(&report)?;
+            pad.send_raw_report(&report)?;
             println!("sent: {}", device::hex(&report[1..]));
             if read {
                 std::thread::sleep(std::time::Duration::from_millis(100));

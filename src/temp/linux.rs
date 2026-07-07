@@ -5,7 +5,7 @@
 //! lints, and tests on Linux, and it makes the curve usable there too.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
@@ -34,6 +34,15 @@ fn parse_millideg(s: &str) -> Result<f64> {
     Ok(raw as f64 / 1000.0)
 }
 
+fn plausible_temp(celsius: f64) -> bool {
+    (-40.0..=150.0).contains(&celsius)
+}
+
+fn read_zone_temp(path: &Path) -> Option<f64> {
+    let celsius = parse_millideg(&fs::read_to_string(path).ok()?).ok()?;
+    plausible_temp(celsius).then_some(celsius)
+}
+
 impl Reader {
     pub fn new() -> Result<Self> {
         let mut zones = Vec::new();
@@ -54,11 +63,7 @@ impl Reader {
                 .map(|s| s.trim().to_string())
                 .unwrap_or_else(|_| entry.file_name().to_string_lossy().into_owned());
             // Only keep zones that are actually readable right now.
-            if fs::read_to_string(&temp_path)
-                .ok()
-                .and_then(|s| parse_millideg(&s).ok())
-                .is_some()
-            {
+            if read_zone_temp(&temp_path).is_some() {
                 zones.push(Zone { name, temp_path });
             }
         }
@@ -70,9 +75,7 @@ impl Reader {
     }
 
     pub fn read(&self) -> Result<f64> {
-        let read_zone = |z: &Zone| -> Option<f64> {
-            parse_millideg(&fs::read_to_string(&z.temp_path).ok()?).ok()
-        };
+        let read_zone = |z: &Zone| read_zone_temp(&z.temp_path);
         let cpu: Vec<f64> = self
             .zones
             .iter()
@@ -99,7 +102,7 @@ impl Reader {
             .zones
             .iter()
             .filter_map(|z| {
-                let celsius = parse_millideg(&fs::read_to_string(&z.temp_path).ok()?).ok()?;
+                let celsius = read_zone_temp(&z.temp_path)?;
                 Some(Reading {
                     name: z.name.clone(),
                     celsius,
@@ -122,6 +125,16 @@ mod tests {
         assert_eq!(parse_millideg("45000\n").unwrap(), 45.0);
         assert_eq!(parse_millideg("-5000").unwrap(), -5.0);
         assert!(parse_millideg("hot").is_err());
+    }
+
+    #[test]
+    fn plausibility_bounds() {
+        assert!(plausible_temp(-40.0));
+        assert!(plausible_temp(80.0));
+        assert!(plausible_temp(150.0));
+        assert!(!plausible_temp(-40.1));
+        assert!(!plausible_temp(150.1));
+        assert!(!plausible_temp(f64::NAN));
     }
 
     #[test]
