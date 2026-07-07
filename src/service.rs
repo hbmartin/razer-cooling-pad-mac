@@ -64,8 +64,9 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn plist_content(exe: &str, log: &str) -> String {
+fn plist_content(exe: &str, home: &str, log: &str) -> String {
     let exe = xml_escape(exe);
+    let home = xml_escape(home);
     let log = xml_escape(log);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -79,10 +80,20 @@ fn plist_content(exe: &str, log: &str) -> String {
         <string>{exe}</string>
         <string>curve</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{home}</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
     <key>ProcessType</key>
     <string>Background</string>
     <key>StandardOutPath</key>
@@ -116,12 +127,16 @@ fn install() -> Result<()> {
 
     let plist = plist_path()?;
     let log = log_path()?;
+    let home = home()?;
     std::fs::create_dir_all(plist.parent().unwrap())
         .with_context(|| format!("creating {}", plist.parent().unwrap().display()))?;
     std::fs::create_dir_all(log.parent().unwrap())
         .with_context(|| format!("creating {}", log.parent().unwrap().display()))?;
-    std::fs::write(&plist, plist_content(&exe_str, &log.to_string_lossy()))
-        .with_context(|| format!("writing {}", plist.display()))?;
+    std::fs::write(
+        &plist,
+        plist_content(&exe_str, &home.to_string_lossy(), &log.to_string_lossy()),
+    )
+    .with_context(|| format!("writing {}", plist.display()))?;
 
     let uid = uid()?;
     // Reload cleanly if a previous version is running.
@@ -191,10 +206,22 @@ mod tests {
 
     #[test]
     fn plist_is_well_formed_and_escaped() {
-        let p = plist_content("/Users/x&y/bin/padctl", "/tmp/padctl <log>.log");
+        let p = plist_content(
+            "/Users/x&y/bin/padctl",
+            "/Users/x&y",
+            "/tmp/padctl <log>.log",
+        );
         assert!(p.contains("<string>/Users/x&amp;y/bin/padctl</string>"));
+        assert!(p.contains("<key>EnvironmentVariables</key>"));
+        assert!(p.contains("<key>HOME</key>"));
+        assert!(p.contains("<string>/Users/x&amp;y</string>"));
         assert!(p.contains("<string>/tmp/padctl &lt;log&gt;.log</string>"));
         assert!(p.contains("<string>curve</string>"));
+        assert!(p.contains("<key>RunAtLoad</key>\n    <true/>"));
+        assert!(p.contains("<key>KeepAlive</key>"));
+        assert!(p.contains("<key>SuccessfulExit</key>\n        <false/>"));
+        assert!(p.contains("<key>ThrottleInterval</key>\n    <integer>30</integer>"));
+        assert!(p.contains("<key>ProcessType</key>\n    <string>Background</string>"));
         assert!(p.contains(LABEL));
         assert!(p.starts_with("<?xml"));
     }

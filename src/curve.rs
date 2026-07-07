@@ -475,6 +475,9 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
         }
 
         match reader.read() {
+            Ok(raw) if !raw.is_finite() => {
+                log::warn!("temperature read was not finite: {raw}");
+            }
             Ok(raw) => {
                 let out = controller.tick(raw, s.interval as f64, Instant::now());
                 let (temp, target, decision) = (out.smoothed, out.target, out.decision);
@@ -536,7 +539,7 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
         }
 
         // Sleep in small slices so signals exit promptly.
-        let mut remaining = s.interval * 10;
+        let mut remaining = s.interval.saturating_mul(10);
         while remaining > 0 && is_running() {
             std::thread::sleep(Duration::from_millis(100));
             remaining -= 1;
@@ -550,10 +553,10 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                 pad = Pad::open(api, selector, opts).ok();
             }
             match &pad {
-                Some(p) => {
-                    p.send(&fan::off())?;
-                    log::info!("fan off");
-                }
+                Some(p) => match p.send(&fan::off()) {
+                    Ok(()) => log::info!("fan off"),
+                    Err(e) => log::warn!("failed to turn the fan off: {e:#}"),
+                },
                 None => log::warn!("pad unavailable, could not turn the fan off"),
             }
         }

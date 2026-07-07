@@ -14,8 +14,9 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,8 +25,12 @@ jobs:
   release:
     name: universal macOS binary (self-hosted)
     runs-on: [self-hosted, macOS]
+    permissions:
+      contents: write # needed to create the GitHub release and upload assets
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - name: Ensure Rust toolchain
         run: |
           if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
@@ -54,7 +59,7 @@ jobs:
           shasum -a 256 "padctl-${GITHUB_REF_NAME}-macos-universal.tar.gz" \
             > "padctl-${GITHUB_REF_NAME}-macos-universal.tar.gz.sha256"
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             dist/padctl-*.tar.gz
