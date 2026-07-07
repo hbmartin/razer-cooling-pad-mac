@@ -15,7 +15,7 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 ctrlc = { version = "3", features = ["termination"] }
 log = "0.4"
 ratatui = "0.29"
