@@ -19,6 +19,7 @@ use hidapi::HidApi;
 use crate::config::CurveConfig;
 use crate::device::{OpenOpts, Pad, Selector};
 use crate::fan;
+use crate::power;
 use crate::temp::TempReader;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -133,7 +134,8 @@ pub fn resolve(args: &CurveArgs, file: Option<&CurveConfig>) -> Result<Settings>
     })
 }
 
-fn parse_points(s: &str) -> Result<Vec<(f64, u32)>> {
+/// Parse "temp:rpm,temp:rpm,..." into a sorted curve (RPM 0 = fans off).
+pub fn parse_points(s: &str) -> Result<Vec<(f64, u32)>> {
     let mut points = Vec::new();
     for pair in s.split(',') {
         let (t, r) = pair
@@ -164,7 +166,7 @@ fn parse_points(s: &str) -> Result<Vec<(f64, u32)>> {
 }
 
 /// Piecewise-linear interpolation, clamped to the end points.
-fn target_rpm(points: &[(f64, u32)], temp: f64) -> u32 {
+pub fn target_rpm(points: &[(f64, u32)], temp: f64) -> u32 {
     let first = points.first().unwrap();
     let last = points.last().unwrap();
     if temp <= first.0 {
@@ -193,6 +195,12 @@ struct Ema {
 impl Ema {
     fn new(tau: f64) -> Self {
         Ema { tau, value: None }
+    }
+
+    /// Discard the history (e.g. after system sleep, when the last samples
+    /// are minutes or hours stale).
+    fn reset(&mut self) {
+        self.value = None;
     }
 
     fn update(&mut self, sample: f64, dt: f64) -> f64 {
@@ -333,6 +341,14 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
         .context("installing signal handler")?;
     let is_running = || running.load(std::sync::atomic::Ordering::SeqCst);
 
+    // Sleep/wake notifications (macOS): turn the fans off before sleep and
+    // reconnect promptly on wake instead of waiting for a send to fail.
+    let mut power = power::start();
+    match &power {
+        Some(_) => log::debug!("watching system sleep/wake notifications"),
+        None => log::debug!("sleep/wake notifications unavailable; relying on reconnect"),
+    }
+
     let mut pad: Option<Pad> = None;
     let mut outage_reported = false;
     let mut ema = Ema::new(s.smooth);
@@ -341,6 +357,51 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
     let mut last_status_log = Instant::now();
 
     while is_running() {
+        if let Some(mon) = power.as_mut() {
+            while let Some(t) = mon.poll() {
+                match t {
+                    power::Transition::Slept => {
+                        log::info!("system is going to sleep");
+                        // With on-exit off, don't leave the fans spinning
+                        // all night on a sleeping machine (USB ports can
+                        // stay powered). The governor reset makes the next
+                        // awake poll resend the right speed.
+                        if s.on_exit == OnExit::Off
+                            && !args.dry_run
+                            && let Some(p) = &pad
+                        {
+                            match p.send(&fan::off()) {
+                                Ok(()) => {
+                                    log::info!("fan off for sleep");
+                                    governor.reset();
+                                }
+                                Err(e) => {
+                                    log::debug!("fan off for sleep failed: {e:#}");
+                                    pad = None;
+                                }
+                            }
+                        }
+                    }
+                    power::Transition::Woke => {
+                        log::info!("system woke; reconnecting to the pad");
+                        // The old handle may be stale, the pad may have
+                        // lost power (forgetting custom frames), and the
+                        // pre-sleep temperature history means nothing now.
+                        pad = None;
+                        governor.reset();
+                        ema.reset();
+                        outage_reported = false;
+                    }
+                }
+            }
+            if mon.is_asleep() {
+                // Nothing useful to do until wake; check again shortly so
+                // the wake is handled promptly.
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+        }
+
         // (Re)connect if needed, so the pad recovers from unplug/replug and
         // sleep/wake without restarting the process.
         if !args.dry_run && pad.is_none() {
@@ -441,9 +502,10 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
             Err(e) => log::warn!("temperature read failed: {e:#}"),
         }
 
-        // Sleep in small slices so signals exit promptly.
+        // Sleep in small slices so signals exit promptly and sleep/wake
+        // transitions are handled without waiting out the poll interval.
         let mut remaining = s.interval * 10;
-        while remaining > 0 && is_running() {
+        while remaining > 0 && is_running() && power.as_ref().is_none_or(|m| !m.pending()) {
             std::thread::sleep(Duration::from_millis(100));
             remaining -= 1;
         }

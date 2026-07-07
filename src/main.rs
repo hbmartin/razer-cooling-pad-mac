@@ -1,27 +1,12 @@
-mod config;
-mod curve;
-mod device;
-mod fan;
-mod lighting;
-mod logging;
-mod packet;
-mod parse;
-mod reactive;
-mod rgb;
-mod service;
-mod temp;
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-compile_error!("padctl supports macOS (its primary target) and Linux (protocol work, CI) only");
-
 use std::io::Write;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 
-use crate::device::{OpenOpts, Pad, Selector};
-use crate::packet::{PACKET_LEN, REPORT_LEN, Response};
-use crate::parse::Speed;
+use padctl::device::{self, OpenOpts, Pad, Selector};
+use padctl::packet::{self, PACKET_LEN, REPORT_LEN};
+use padctl::parse::{self, Speed};
+use padctl::{config, curve, doctor, fan, lighting, logging, reactive, rgb, service, temp};
 
 #[derive(Parser)]
 #[command(
@@ -126,6 +111,13 @@ enum Cmd {
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
+    },
+    /// Diagnose common problems: device, permissions, Synapse, config,
+    /// service health, temperature source
+    Doctor {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Generate shell completions (e.g. `padctl completions zsh`)
     Completions {
@@ -252,6 +244,11 @@ fn run(cli: Cli) -> Result<()> {
                 println!("{celsius:.1}°C ({})", reader.source_name());
             }
             return Ok(());
+        }
+        Cmd::Doctor { json } => {
+            // Doctor manages the device itself: a missing pad is a finding,
+            // not a reason to abort the other checks.
+            return doctor::run(&cli.selector(), *json);
         }
         Cmd::Sensors { json } => {
             let reader = temp::TempReader::new()?;
@@ -464,11 +461,11 @@ fn run(cli: Cli) -> Result<()> {
             if json {
                 print_json(&serde_json::json!({
                     "firmware": format!("{}.{}", fw.args[0], fw.args[1]),
-                    "serial": serial_text(&serial),
+                    "serial": rgb::serial_text(&serial),
                 }))?;
             } else {
                 println!("firmware: v{}.{}", fw.args[0], fw.args[1]);
-                println!("serial:   {}", serial_text(&serial));
+                println!("serial:   {}", rgb::serial_text(&serial));
             }
         }
         Cmd::Status { json } => {
@@ -492,7 +489,7 @@ fn run(cli: Cli) -> Result<()> {
                     "fan_percent": if rpm == 0 { None } else { Some(fan::rpm_to_percent(rpm)) },
                     "brightness_percent": brightness_pct,
                     "firmware": format!("{}.{}", fw.args[0], fw.args[1]),
-                    "serial": serial_text(&serial),
+                    "serial": rgb::serial_text(&serial),
                     "cpu_temp_celsius": celsius,
                     "temp_source": source,
                 }))?;
@@ -504,7 +501,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 println!("brightness: {brightness_pct}%");
                 println!("firmware:   v{}.{}", fw.args[0], fw.args[1]);
-                println!("serial:     {}", serial_text(&serial));
+                println!("serial:     {}", rgb::serial_text(&serial));
                 match temp {
                     Ok((t, source)) => println!("cpu temp:   {t:.1}°C ({source})"),
                     Err(e) => println!("cpu temp:   unavailable ({e:#})"),
@@ -544,7 +541,8 @@ fn run(cli: Cli) -> Result<()> {
         | Cmd::Completions { .. }
         | Cmd::Manpage
         | Cmd::Temp { .. }
-        | Cmd::Sensors { .. } => unreachable!(),
+        | Cmd::Sensors { .. }
+        | Cmd::Doctor { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -562,14 +560,4 @@ fn send_custom_frame(pad: &Pad, frame: &[rgb::Rgb], driver_mode: bool) -> Result
     pad.send(&rgb::custom_frame(0, frame))?;
     pad.send(&rgb::custom_apply())?;
     Ok(())
-}
-
-/// Decode the printable ASCII serial from a serial-query response.
-fn serial_text(resp: &Response) -> String {
-    resp.args[..22]
-        .iter()
-        .take_while(|&&b| b != 0)
-        .map(|&b| b as char)
-        .filter(|c| c.is_ascii_graphic())
-        .collect()
 }

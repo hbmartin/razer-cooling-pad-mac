@@ -1,0 +1,58 @@
+# Coverage-guided fuzzing of padctl's parsing surfaces.
+# Run with: cargo +nightly fuzz run <target>   (cargo install cargo-fuzz)
+[package]
+name = "padctl-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.padctl]
+path = ".."
+
+[[bin]]
+name = "parse_speed"
+path = "fuzz_targets/parse_speed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_color"
+path = "fuzz_targets/parse_color.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hex_decode"
+path = "fuzz_targets/hex_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "curve_points"
+path = "fuzz_targets/curve_points.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "response"
+path = "fuzz_targets/response.rs"
+test = false
+doc = false
+bench = false
