@@ -12,13 +12,35 @@ driver (`driver/razerchromacommon.c`) for the lighting commands.
 
 ## Install
 
+Homebrew (tap):
+
+```bash
+brew tap hbmartin/tap
+brew install padctl
+```
+
+crates.io:
+
+```bash
+cargo install padctl
+```
+
+Prebuilt binary — tagged releases attach a universal (arm64 + x86_64) macOS
+binary. It is ad-hoc signed, so if you download it **via a browser**
+Gatekeeper will quarantine it; clear the flag once:
+
+```bash
+tar xzf padctl-*-macos-universal.tar.gz
+xattr -d com.apple.quarantine padctl   # only needed for browser downloads
+```
+
+(`curl`/`brew`/`cargo` installs don't set the quarantine attribute.)
+
+From source:
+
 ```bash
 cargo build --release   # -> target/release/padctl (self-contained)
 ```
-
-Tagged releases build a signed universal (arm64 + x86_64) macOS binary via
-the release workflow. A Homebrew formula template lives in
-`packaging/homebrew/` for publishing to a tap.
 
 Shell completions and a man page are built in:
 
@@ -58,6 +80,9 @@ padctl rgb thermal                       # live CPU-temp meter, green→red
 padctl temp                        # the reading the fan curve would use
 padctl sensors                     # every sensor padctl can see
 
+# Machine-readable output for scripting (also: info, temp, sensors, fan get)
+padctl status --json | jq .cpu_temp_celsius
+
 # Automatic fan curve from CPU temperature (Ctrl-C to stop)
 padctl curve                       # defaults: 55:800,65:1500,75:2200,85:3200
 padctl curve --points "50:0,60:1200,75:2400,85:3200" --interval 5 --on-exit off
@@ -70,7 +95,7 @@ padctl raw "00 1f 00 00 00 03 0f 84 01 00" --auto-crc --read
 
 Global flags on every command:
 
-- `-v` dumps the raw packets sent/received.
+- `-v` enables debug logging: raw packets sent/received, every curve poll.
 - `--verify` reads back the device status after each command and fails
   loudly if the device rejected it (best effort).
 - `--serial <S>` / `--path <P>` select a specific pad when more than one is
@@ -96,7 +121,11 @@ The loop is built to run unattended:
   the curve keeps running and re-attaches automatically.
 - **Signals** — SIGINT/SIGTERM/SIGHUP all trigger the `--on-exit` behavior
   (`off` by default), so `launchctl bootout` and plain `kill` are safe.
-- **Timestamps** — every log line is timestamped, ready for a log file.
+- **Quiet logs** — every line is timestamped, but only *decision changes*
+  are logged (a new speed sent, or the start of a pending spin-down), plus a
+  status heartbeat every 10 minutes so the log shows the loop is alive. Run
+  with `-v` to see every poll. At the default 5 s poll interval this keeps
+  an unattended log file to a few lines per hour instead of thousands.
 
 ## Run it at login (launchd service)
 
@@ -113,6 +142,29 @@ The service runs plain `padctl curve`, which reads its settings from
 instead of baking flags into the plist. CLI flags override the config for
 interactive runs. Install from a stable binary location (e.g.
 `/usr/local/bin/padctl`), not a build tree.
+
+## Lighting at login
+
+The config file's `[lighting]` section describes the lighting you want, and
+the fan curve applies it on startup and on every reconnect — so the launchd
+service restores your preferred look at login and after the pad is
+unplugged/replugged (the pad forgets custom frames when it loses power):
+
+```toml
+[lighting]
+effect = "static"        # off | static | spectrum | wave | breath | gradient | custom
+colors = ["ff6600"]      # static: 1, breath: 0-2, gradient: 2, custom: 1-18
+brightness = 80          # 0-100, applied before the effect
+#wave_dir = "right"      # wave only
+#wave_speed = 40         # wave only
+#driver_mode = false     # gradient/custom only (experimental effects)
+```
+
+Apply it on demand without touching the fans:
+
+```bash
+padctl rgb apply
+```
 
 ## Custom frames / thermal lighting (experimental)
 
@@ -154,7 +206,13 @@ CI (GitHub Actions):
   Runners* with the default `self-hosted` + `macOS` labels; the jobs are
   guarded so fork PRs never reach it.
 - **Release**: pushing a `v*` tag builds a universal binary on the mac
-  runner and attaches it to a GitHub release.
+  runner and attaches it to a GitHub release. Two follow-up jobs then run on
+  GitHub-hosted runners, each skipping itself cleanly if its secret is not
+  configured: publishing the crate to crates.io (`CARGO_REGISTRY_TOKEN`) and
+  pushing an updated formula to `hbmartin/homebrew-tap`
+  (`HOMEBREW_TAP_TOKEN`, a PAT with push access to the tap).
+- **Dependabot** files weekly PRs for Cargo dependencies and pinned
+  workflow actions.
 
 ## Protocol notes
 

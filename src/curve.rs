@@ -5,6 +5,10 @@
 //! timestamps on every line, exponential smoothing against spiky loads,
 //! delayed spin-down so the fans don't oscillate, and automatic reconnect
 //! when the pad is unplugged/replugged or the machine sleeps.
+//!
+//! Logging is deliberately quiet for long unattended runs: only decision
+//! changes (sends and the start of a pending spin-down) are logged at info,
+//! plus a periodic heartbeat; every poll is visible at debug (`-v`).
 
 use std::time::{Duration, Instant};
 
@@ -61,6 +65,10 @@ pub struct CurveArgs {
 
 /// Only push a new speed when the target moves at least this much.
 const HYSTERESIS_RPM: u32 = 100;
+
+/// Log a status line at least this often even when nothing changes, so an
+/// unattended log file shows the loop is alive.
+const HEARTBEAT: Duration = Duration::from_secs(600);
 
 const DEFAULT_POINTS: &str = "55:800,65:1500,75:2200,85:3200";
 const DEFAULT_INTERVAL: u64 = 5;
@@ -263,15 +271,16 @@ impl Governor {
         self.down_since = None;
     }
 
+    /// The last speed actually applied to the device, if any.
+    fn applied(&self) -> Option<u32> {
+        self.last
+    }
+
     /// Forget device state (after a reconnect the pad may run any speed).
     fn reset(&mut self) {
         self.last = None;
         self.down_since = None;
     }
-}
-
-fn timestamp() -> String {
-    chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
 fn rpm_text(rpm: u32) -> String {
@@ -289,9 +298,15 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
         crate::config::load()?
     };
     let s = resolve(&args, file_config.as_ref().map(|c| &c.curve))?;
+    // Validate the [lighting] section up front so a broken config fails
+    // loudly at startup instead of on the first reconnect.
+    let lighting = match &file_config {
+        Some(c) => crate::lighting::plan(&c.lighting)?,
+        None => None,
+    };
 
     let reader = TempReader::new()?;
-    println!(
+    log::info!(
         "fan curve: {} | temp source: {} | poll {}s | smooth {}s | down-delay {}s{}{}",
         s.points
             .iter()
@@ -322,6 +337,8 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
     let mut outage_reported = false;
     let mut ema = Ema::new(s.smooth);
     let mut governor = Governor::new(HYSTERESIS_RPM, Duration::from_secs(s.down_delay));
+    let mut pending_reported = false;
+    let mut last_status_log = Instant::now();
 
     while is_running() {
         // (Re)connect if needed, so the pad recovers from unplug/replug and
@@ -331,17 +348,24 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
             match Pad::open(api, selector, opts) {
                 Ok(p) => {
                     if outage_reported {
-                        eprintln!("[{}] cooling pad reconnected", timestamp());
+                        log::info!("cooling pad reconnected");
                     }
                     outage_reported = false;
+                    // The pad may have rebooted: restore lighting and make
+                    // sure the next fan target is resent.
+                    if let Some(plan) = &lighting {
+                        match plan.packets.iter().try_for_each(|pkt| p.send(pkt)) {
+                            Ok(()) => log::info!("lighting: {}", plan.summary),
+                            Err(e) => log::warn!("failed to apply lighting: {e:#}"),
+                        }
+                    }
                     pad = Some(p);
-                    // The pad may have rebooted; make sure we resend.
                     governor.reset();
                 }
                 Err(e) => {
                     if !outage_reported {
-                        eprintln!("[{}] warning: {e:#}", timestamp());
-                        eprintln!("[{}] retrying every {}s", timestamp(), s.interval);
+                        log::warn!("{e:#}");
+                        log::warn!("retrying every {}s", s.interval);
                         outage_reported = true;
                     }
                 }
@@ -360,27 +384,38 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                 };
 
                 let decision = governor.decide(target, Instant::now());
-                let marker = match decision {
-                    Decision::Send => "->",
-                    Decision::Hold => "  ",
-                    Decision::PendingDown => "..",
-                };
-                let detail = if opts.verbose && s.smooth > 0.0 {
+                let detail = if s.smooth > 0.0 {
                     format!(" (raw {raw:.1}°C)")
                 } else {
                     String::new()
                 };
-                println!(
-                    "[{}] {temp:5.1}°C {marker} {}{}{}",
-                    timestamp(),
-                    rpm_text(target),
-                    if decision == Decision::PendingDown {
-                        " (down pending)"
-                    } else {
-                        ""
-                    },
-                    detail,
-                );
+                // Info only on decision changes + heartbeat; every poll at debug.
+                match decision {
+                    Decision::Send => {
+                        log::info!("{temp:5.1}°C -> {}{detail}", rpm_text(target));
+                        pending_reported = false;
+                        last_status_log = Instant::now();
+                    }
+                    Decision::PendingDown if !pending_reported => {
+                        log::info!("{temp:5.1}°C .. {} (down pending)", rpm_text(target));
+                        pending_reported = true;
+                        last_status_log = Instant::now();
+                    }
+                    _ => {
+                        if decision == Decision::Hold {
+                            pending_reported = false;
+                        }
+                        if last_status_log.elapsed() >= HEARTBEAT {
+                            log::info!(
+                                "{temp:5.1}°C, fan {} (heartbeat)",
+                                rpm_text(governor.applied().unwrap_or(target)),
+                            );
+                            last_status_log = Instant::now();
+                        } else {
+                            log::debug!("{temp:5.1}°C    {}{detail}", rpm_text(target));
+                        }
+                    }
+                }
 
                 if decision == Decision::Send {
                     if args.dry_run {
@@ -394,10 +429,7 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                         match result {
                             Ok(()) => governor.confirm(target),
                             Err(e) => {
-                                eprintln!(
-                                    "[{}] warning: failed to set fan: {e:#} — will reconnect",
-                                    timestamp()
-                                );
+                                log::warn!("failed to set fan: {e:#} — will reconnect");
                                 pad = None;
                             }
                         }
@@ -406,7 +438,7 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                     // the send is retried as soon as we reconnect.
                 }
             }
-            Err(e) => eprintln!("[{}] warning: temperature read failed: {e:#}", timestamp()),
+            Err(e) => log::warn!("temperature read failed: {e:#}"),
         }
 
         // Sleep in small slices so signals exit promptly.
@@ -426,12 +458,12 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
             match &pad {
                 Some(p) => {
                     p.send(&fan::off())?;
-                    println!("\nfan off");
+                    log::info!("fan off");
                 }
-                None => eprintln!("\nwarning: pad unavailable, could not turn the fan off"),
+                None => log::warn!("pad unavailable, could not turn the fan off"),
             }
         }
-        _ => println!("\nleaving fan as-is"),
+        _ => log::info!("leaving fan as-is"),
     }
     Ok(())
 }

@@ -12,6 +12,8 @@ use serde::Deserialize;
 pub struct Config {
     #[serde(default)]
     pub curve: CurveConfig,
+    #[serde(default)]
+    pub lighting: LightingConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -27,6 +29,27 @@ pub struct CurveConfig {
     pub smooth: Option<f64>,
     /// Seconds a lower target must persist before the fans slow down.
     pub down_delay: Option<u64>,
+}
+
+/// Lighting applied at `padctl curve` startup (and on every reconnect), so
+/// the launchd service restores the preferred look at login. Also applied
+/// on demand with `padctl rgb apply`. See [`crate::lighting`].
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightingConfig {
+    /// "off", "static", "spectrum", "wave", "breath", "gradient" or "custom".
+    pub effect: Option<String>,
+    /// Colors as 6-hex-digit strings; how many depends on the effect.
+    pub colors: Option<Vec<String>>,
+    /// Brightness 0-100, applied before the effect.
+    pub brightness: Option<u8>,
+    /// Wave direction: "left" or "right" (wave effect only).
+    pub wave_dir: Option<String>,
+    /// Wave speed byte (wave effect only; device default 40).
+    pub wave_speed: Option<u8>,
+    /// Switch to driver mode before sending custom frames
+    /// (gradient/custom effects only).
+    pub driver_mode: Option<bool>,
 }
 
 pub const TEMPLATE: &str = r#"# padctl configuration.
@@ -49,6 +72,28 @@ pub const TEMPLATE: &str = r#"# padctl configuration.
 # How long (seconds) a lower fan target must persist before slowing down.
 # Spin-up is always immediate; this only delays spin-down. 0 disables it.
 #down_delay = 30
+
+# Lighting applied when the fan curve starts (so the launchd service restores
+# it at login) and on `padctl rgb apply`. Leave everything commented out to
+# leave the lighting alone.
+[lighting]
+# Effect: "off", "static", "spectrum", "wave", "breath", "gradient", "custom".
+#effect = "static"
+
+# Colors as 6-hex-digit strings. static: 1 color; breath: 0-2 colors;
+# gradient: 2 colors; custom: 1-18 colors (stretched across the strip).
+#colors = ["ff6600"]
+
+# Brightness 0-100, applied before the effect.
+#brightness = 80
+
+# Wave options (effect = "wave" only).
+#wave_dir = "right"
+#wave_speed = 40
+
+# Gradient/custom frames are experimental on this device; enable driver mode
+# first if the lighting does not change (normal mode is NOT restored).
+#driver_mode = false
 "#;
 
 pub fn dir() -> PathBuf {
@@ -124,8 +169,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_lighting_section() {
+        let c: Config = toml::from_str(
+            r#"
+            [lighting]
+            effect = "wave"
+            brightness = 80
+            wave_dir = "left"
+            wave_speed = 40
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.lighting.effect.as_deref(), Some("wave"));
+        assert_eq!(c.lighting.brightness, Some(80));
+        assert_eq!(c.lighting.wave_dir.as_deref(), Some("left"));
+        assert_eq!(c.lighting.wave_speed, Some(40));
+        assert_eq!(c.lighting.driver_mode, None);
+    }
+
+    #[test]
     fn rejects_unknown_keys() {
         assert!(toml::from_str::<Config>("[curve]\nspeed = 3\n").is_err());
         assert!(toml::from_str::<Config>("[fan]\n").is_err());
+        assert!(toml::from_str::<Config>("[lighting]\ncolour = \"red\"\n").is_err());
     }
 }

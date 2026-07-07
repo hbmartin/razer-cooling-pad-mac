@@ -80,15 +80,13 @@ pub fn run(pad: Pad, args: ThermalArgs) -> Result<()> {
                     Style::Solid => vec![rgb::temp_color(frac); rgb::NUM_LEDS],
                 };
                 if last_frame.as_ref() != Some(&frame) {
-                    if pad.verbose {
-                        eprintln!("{temp:5.1}°C -> frame update");
-                    }
+                    log::debug!("{temp:5.1}°C -> frame update");
                     pad.send(&rgb::custom_frame(0, &frame))?;
                     pad.send(&rgb::custom_apply())?;
                     last_frame = Some(frame);
                 }
             }
-            Err(e) => eprintln!("warning: temperature read failed: {e:#}"),
+            Err(e) => log::warn!("temperature read failed: {e:#}"),
         }
 
         let mut remaining = interval * 10;
