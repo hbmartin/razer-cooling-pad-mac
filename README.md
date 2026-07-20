@@ -55,6 +55,7 @@ padctl manpage > /usr/local/share/man/man1/padctl.1
 padctl list                        # show the pad's HID interfaces (+ serials)
 padctl info                        # firmware version + serial
 padctl status                      # fan, brightness, firmware, serial, CPU temp
+padctl doctor                      # diagnose common problems (also: --json)
 
 # Fans (500-3200 RPM, 50 RPM steps)
 padctl fan set 1500
@@ -123,6 +124,13 @@ The loop is built to run unattended:
   of a 100 RPM hysteresis band. No more oscillating fan noise.
 - **Reconnect** — if the pad is unplugged, replugged, or the machine sleeps,
   the curve keeps running and re-attaches automatically.
+- **Sleep/wake aware** (macOS) — the loop registers for system power
+  notifications (`IORegisterForSystemPower`): before the machine sleeps it
+  turns the fans off (unless `--on-exit keep`), so a closed laptop doesn't
+  sit on spinning fans all night; on wake it reconnects immediately,
+  restores the configured lighting, and resends the right fan speed instead
+  of waiting for the next send to fail. Temperature smoothing restarts on
+  wake so hours-stale readings don't drag the average.
 - **Signals** — SIGINT/SIGTERM/SIGHUP all trigger the `--on-exit` behavior
   (`off` by default), so `launchctl bootout` and plain `kill` are safe.
 - **Quiet logs** — every line is timestamped, but only *decision changes*
@@ -233,6 +241,21 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
+The crate is a library (`src/lib.rs`, all protocol/parsing/curve logic)
+plus a thin CLI binary (`src/main.rs`). Everything that parses untrusted
+input — CLI speed/color/hex arguments, curve points, config TOML, raw
+device responses — is covered two ways:
+
+- **Property tests** (`tests/properties.rs`, [proptest]): never-panic and
+  round-trip/invariant checks, run by every `cargo test`.
+- **Fuzz targets** (`fuzz/`, [cargo-fuzz]): coverage-guided fuzzing of the
+  same surfaces. `cargo install cargo-fuzz`, then
+  `cargo +nightly fuzz run parse_speed` (see `cargo fuzz list` for all
+  targets). CI smoke-runs every target weekly.
+
+[proptest]: https://github.com/proptest-rs/proptest
+[cargo-fuzz]: https://github.com/rust-fuzz/cargo-fuzz
+
 CI (GitHub Actions):
 
 - **Lint** and **Linux build/test** run on GitHub-hosted `ubuntu-latest`.
@@ -247,6 +270,8 @@ CI (GitHub Actions):
   configured: publishing the crate to crates.io (`CARGO_REGISTRY_TOKEN`) and
   pushing an updated formula to `hbmartin/homebrew-tap`
   (`HOMEBREW_TAP_TOKEN`, a PAT with push access to the tap).
+- **Fuzz** smoke-runs each cargo-fuzz target for a minute, weekly and on
+  PRs touching `fuzz/`.
 - **Dependabot** files weekly PRs for Cargo dependencies and pinned
   workflow actions.
 
@@ -283,6 +308,12 @@ Queries (`0x8x` commands) are sent, then the response is read back with
 GetFeature after ~100 ms; busy responses are retried.
 
 ## Troubleshooting
+
+Run `padctl doctor` first — it automates every check below (device found,
+control interface opens, protocol responds, brightness stuck at 0, Razer
+Synapse running, temperature source, config validity, service health) and
+prints a concrete fix for anything it flags. `--json` for scripting; the
+exit code is non-zero when a check fails.
 
 - **Open fails with a permission error** — grant your terminal app *Input
   Monitoring* in System Settings → Privacy & Security (usually not needed:

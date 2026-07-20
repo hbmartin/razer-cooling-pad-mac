@@ -37,7 +37,8 @@ fn home() -> Result<PathBuf> {
         .context("HOME is not set")
 }
 
-fn plist_path() -> Result<PathBuf> {
+/// Path of the installed LaunchAgent plist (also used by `padctl doctor`).
+pub fn plist_path() -> Result<PathBuf> {
     Ok(home()?
         .join("Library/LaunchAgents")
         .join(format!("{LABEL}.plist")))
@@ -64,8 +65,28 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn plist_content(exe: &str, log: &str) -> String {
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Extract the program path from an agent plist we wrote: the first
+/// `<string>` under `ProgramArguments`. Used by `padctl doctor` to notice
+/// a service pointing at a moved or deleted binary.
+pub fn program_from_plist(plist: &str) -> Option<String> {
+    let after_key = plist.split("<key>ProgramArguments</key>").nth(1)?;
+    let value = after_key
+        .split("<string>")
+        .nth(1)?
+        .split("</string>")
+        .next()?;
+    Some(xml_unescape(value))
+}
+
+fn plist_content(exe: &str, home: &str, log: &str) -> String {
     let exe = xml_escape(exe);
+    let home = xml_escape(home);
     let log = xml_escape(log);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -79,10 +100,20 @@ fn plist_content(exe: &str, log: &str) -> String {
         <string>{exe}</string>
         <string>curve</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{home}</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
     <key>ProcessType</key>
     <string>Background</string>
     <key>StandardOutPath</key>
@@ -116,12 +147,16 @@ fn install() -> Result<()> {
 
     let plist = plist_path()?;
     let log = log_path()?;
+    let home = home()?;
     std::fs::create_dir_all(plist.parent().unwrap())
         .with_context(|| format!("creating {}", plist.parent().unwrap().display()))?;
     std::fs::create_dir_all(log.parent().unwrap())
         .with_context(|| format!("creating {}", log.parent().unwrap().display()))?;
-    std::fs::write(&plist, plist_content(&exe_str, &log.to_string_lossy()))
-        .with_context(|| format!("writing {}", plist.display()))?;
+    std::fs::write(
+        &plist,
+        plist_content(&exe_str, &home.to_string_lossy(), &log.to_string_lossy()),
+    )
+    .with_context(|| format!("writing {}", plist.display()))?;
 
     let uid = uid()?;
     // Reload cleanly if a previous version is running.
@@ -160,6 +195,28 @@ fn uninstall() -> Result<()> {
     Ok(())
 }
 
+/// Whether the launch agent is currently loaded in launchd; `Ok(Some(_))`
+/// carries its state/pid detail when available. Also used by `padctl doctor`.
+pub fn agent_runtime() -> Result<Option<String>> {
+    let uid = uid()?;
+    let out = launchctl(&["print", &format!("gui/{uid}/{LABEL}")])?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let parts: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("state =") || l.starts_with("pid ="))
+        .map(str::to_string)
+        .collect();
+    Ok(Some(if parts.is_empty() {
+        "loaded".to_string()
+    } else {
+        parts.join(", ")
+    }))
+}
+
 fn status() -> Result<()> {
     let plist = plist_path()?;
     println!(
@@ -167,19 +224,14 @@ fn status() -> Result<()> {
         plist.display(),
         if plist.exists() { "present" } else { "missing" }
     );
-    let uid = uid()?;
-    let out = launchctl(&["print", &format!("gui/{uid}/{LABEL}")])?;
-    if out.status.success() {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            let line = line.trim();
-            if line.starts_with("state =") || line.starts_with("pid =") {
-                println!("{line}");
+    match agent_runtime()? {
+        Some(detail) => {
+            if detail != "loaded" {
+                println!("{detail}");
             }
+            println!("loaded: yes");
         }
-        println!("loaded: yes");
-    } else {
-        println!("loaded: no");
+        None => println!("loaded: no"),
     }
     println!("logs:  {}", log_path()?.display());
     Ok(())
@@ -191,11 +243,34 @@ mod tests {
 
     #[test]
     fn plist_is_well_formed_and_escaped() {
-        let p = plist_content("/Users/x&y/bin/padctl", "/tmp/padctl <log>.log");
+        let p = plist_content(
+            "/Users/x&y/bin/padctl",
+            "/Users/x&y",
+            "/tmp/padctl <log>.log",
+        );
         assert!(p.contains("<string>/Users/x&amp;y/bin/padctl</string>"));
+        assert!(p.contains("<key>EnvironmentVariables</key>"));
+        assert!(p.contains("<key>HOME</key>"));
+        assert!(p.contains("<string>/Users/x&amp;y</string>"));
         assert!(p.contains("<string>/tmp/padctl &lt;log&gt;.log</string>"));
         assert!(p.contains("<string>curve</string>"));
+        assert!(p.contains("<key>RunAtLoad</key>\n    <true/>"));
+        assert!(p.contains("<key>KeepAlive</key>"));
+        assert!(p.contains("<key>SuccessfulExit</key>\n        <false/>"));
+        assert!(p.contains("<key>ThrottleInterval</key>\n    <integer>30</integer>"));
+        assert!(p.contains("<key>ProcessType</key>\n    <string>Background</string>"));
         assert!(p.contains(LABEL));
         assert!(p.starts_with("<?xml"));
+    }
+
+    #[test]
+    fn program_round_trips_through_plist() {
+        let p = plist_content("/Users/x&y/bin/padctl", "/Users/x&y", "/tmp/padctl.log");
+        assert_eq!(
+            program_from_plist(&p).as_deref(),
+            Some("/Users/x&y/bin/padctl")
+        );
+        assert_eq!(program_from_plist("not a plist"), None);
+        assert_eq!(program_from_plist(""), None);
     }
 }

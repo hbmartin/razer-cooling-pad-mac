@@ -46,7 +46,8 @@ pub fn parse_speed(s: &str) -> Result<Speed> {
 
 /// Parse a 6-hex-digit color like `ff6600` (leading `#` allowed).
 pub fn parse_color(s: &str) -> Result<(u8, u8, u8)> {
-    let s = s.trim().trim_start_matches('#');
+    let trimmed = s.trim();
+    let s = trimmed.strip_prefix('#').unwrap_or(trimmed);
     if s.len() != 6 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
         bail!("color must be 6 hex digits like ff6600");
     }
@@ -99,6 +100,8 @@ mod tests {
     fn color_parses_with_and_without_hash() {
         assert_eq!(parse_color("ff6600").unwrap(), (0xFF, 0x66, 0x00));
         assert_eq!(parse_color("#00ff00").unwrap(), (0x00, 0xFF, 0x00));
+        assert!(parse_color("##00ff00").is_err());
+        assert!(parse_color("###ff6600").is_err());
         assert!(parse_color("ff660").is_err());
         assert!(parse_color("gg6600").is_err());
         assert!(parse_color("").is_err());

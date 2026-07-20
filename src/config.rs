@@ -108,6 +108,11 @@ pub fn path() -> PathBuf {
     dir().join("config.toml")
 }
 
+/// Parse config file text.
+pub fn parse(text: &str) -> Result<Config> {
+    Ok(toml::from_str(text)?)
+}
+
 /// Load the config file if it exists. A file that exists but does not parse
 /// is a hard error — silently ignoring it would be worse.
 pub fn load() -> Result<Option<Config>> {
@@ -117,8 +122,7 @@ pub fn load() -> Result<Option<Config>> {
     }
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let config: Config =
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let config = parse(&text).with_context(|| format!("parsing {}", path.display()))?;
     Ok(Some(config))
 }
 

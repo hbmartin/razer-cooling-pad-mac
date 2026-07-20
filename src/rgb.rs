@@ -182,6 +182,16 @@ pub fn serial() -> Packet {
     Packet::new(TID_RGB, 0x00, 0x82, 0x16, &[])
 }
 
+/// Decode the printable ASCII serial from a serial-query response.
+pub fn serial_text(resp: &crate::packet::Response) -> String {
+    resp.args[..22]
+        .iter()
+        .take_while(|&&b| b != 0)
+        .map(|&b| b as char)
+        .filter(|c| c.is_ascii_graphic())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Color helpers for custom frames.
 

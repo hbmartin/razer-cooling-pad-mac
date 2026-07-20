@@ -1,6 +1,6 @@
 [package]
 name = "padctl"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 description = "CLI to control the fans and lights of a Razer Laptop Cooling Pad on macOS"
@@ -9,6 +9,7 @@ repository = "https://github.com/hbmartin/razer-cooling-pad-mac"
 readme = "README.md"
 keywords = ["razer", "cooling-pad", "hid", "fan-control", "macos"]
 categories = ["command-line-utilities", "hardware-support"]
+exclude = ["/fuzz"]
 
 [dependencies]
 anyhow = "1"
@@ -30,6 +31,9 @@ hidapi = { version = "2.6", default-features = false, features = ["macos-shared-
 
 [target.'cfg(target_os = "linux")'.dependencies]
 hidapi = { version = "2.6", default-features = false, features = ["linux-static-hidraw"] }
+
+[dev-dependencies]
+proptest = "1"
 
 [profile.release]
 lto = true
